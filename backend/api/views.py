@@ -5,11 +5,10 @@ from django.core.files.storage import default_storage
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import WebsiteConfig, Column, BackgroundOverlay, Section
-from .serializers import ConfigSerializer, ColumnSerializer, WebsiteConfigSerializer
-from .ai_service import generate_config
+from .models import WebsiteConfig, Column, BackgroundOverlay, Section, Project, Category, Product, Order, OrderLine
+from .ai_service import generate_config, handle_chat_message
 
-VALID_SECTION_TYPES = {'hero', 'columns', 'overlay'}
+VALID_SECTION_TYPES = {'hero', 'columns', 'gallery', 'testimonials', 'stats', 'overlay', 'navbar', 'footer'}
 
 
 def _normalize_section_order(section_order):
@@ -58,6 +57,27 @@ class GenerateView(APIView):
         WebsiteConfig.objects.get_or_create(id=1)
         WebsiteConfig.objects.filter(id=1).update(original_prompt=prompt)
         return Response({**config, 'original_prompt': prompt}, status=status.HTTP_200_OK)
+
+
+class ChatView(APIView):
+    def post(self, request):
+        project_name = str(request.data.get('project_name', '') or '').strip()
+        catalog = request.data.get('catalog')
+        message_history = request.data.get('message_history', [])
+        user_message = str(request.data.get('user_message', '') or '').strip()
+        if not user_message:
+            return Response(
+                {'error': 'user_message is required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            result = handle_chat_message(project_name, catalog, message_history, user_message)
+        except Exception as e:
+            return Response(
+                {'error': f'Ollama unavailable ({type(e).__name__}): {str(e)}'},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+        return Response(result, status=status.HTTP_200_OK)
 
 def build_legacy_view(config, sections):
     """Construit les champs hérités (hero_banner, columns, overlay) depuis les sections."""
@@ -273,3 +293,224 @@ class UploadImagesView(APIView):
                 img = request.FILES[key]
                 result['overlay_images'].append(default_storage.save(os.path.join('overlay', img.name), img))
         return Response(result, status=status.HTTP_200_OK)
+
+
+def _project_products(category):
+    return [
+        {
+            'id': p.id,
+            'name': p.name,
+            'price': p.price,
+            'description': p.description,
+            'stock': p.stock,
+            'image_url': p.image_url,
+        }
+        for p in category.products.all()
+    ]
+
+
+def _serialize_project(project):
+    """Sérialise un projet complet : theme, sections (8 types), categories et produits."""
+    return {
+        'id': project.id,
+        'name': project.name,
+        'theme': project.theme,
+        'sections': project.sections,
+        'catalog': [
+            {
+                'id': cat.id,
+                'name': cat.name,
+                'products': _project_products(cat),
+            }
+            for cat in project.categories.all()
+        ],
+        'original_prompt': project.original_prompt,
+        'created_at': project.created_at.isoformat(),
+        'updated_at': project.updated_at.isoformat(),
+    }
+
+
+class ProjectView(APIView):
+    def get(self, request):
+        name = (request.query_params.get('name') or '').strip()
+        project_id = (request.query_params.get('id') or '').strip()
+        if name or project_id:
+            try:
+                if name:
+                    project = Project.objects.get(name=name)
+                else:
+                    project = Project.objects.get(id=project_id)
+            except (Project.DoesNotExist, ValueError):
+                return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+            return Response(_serialize_project(project), status=status.HTTP_200_OK)
+
+        projects = Project.objects.order_by('-updated_at')
+        return Response([
+            {
+                'id': p.id,
+                'name': p.name,
+                'sections_count': len(p.sections) if isinstance(p.sections, list) else 0,
+                'categories_count': p.categories.count(),
+                'updated_at': p.updated_at.isoformat(),
+            }
+            for p in projects
+        ], status=status.HTTP_200_OK)
+
+    def post(self, request):
+        project_name = str(request.data.get('project_name', '') or '').strip()
+        if not project_name:
+            return Response({'error': 'Project name is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        theme = request.data.get('theme') if isinstance(request.data.get('theme'), dict) else {}
+        sections = request.data.get('sections') if isinstance(request.data.get('sections'), list) else []
+        catalog = request.data.get('catalog') if isinstance(request.data.get('catalog'), list) else []
+        original_prompt = str(request.data.get('original_prompt', '') or '')
+
+        project, created = Project.objects.update_or_create(
+            name=project_name,
+            defaults={'theme': theme, 'sections': sections, 'original_prompt': original_prompt},
+        )
+
+        project.categories.all().delete()
+        if isinstance(catalog, list):
+            for cat in catalog:
+                if not isinstance(cat, dict):
+                    continue
+                cat_name = str(cat.get('name', '') or '').strip()
+                if not cat_name:
+                    continue
+                category = Category.objects.create(project=project, name=cat_name)
+                products = cat.get('products')
+                if isinstance(products, list):
+                    for prod in products:
+                        if not isinstance(prod, dict):
+                            continue
+                        prod_name = str(prod.get('name', '') or '').strip()
+                        if not prod_name:
+                            continue
+                        try:
+                            stock = int(prod.get('stock', 0) or 0)
+                        except (ValueError, TypeError):
+                            stock = 0
+                        Product.objects.create(
+                            category=category,
+                            name=prod_name,
+                            price=str(prod.get('price', '') or ''),
+                            description=str(prod.get('description', '') or '') or None,
+                            stock=stock,
+                            image_url=str(prod.get('image_url', '') or '') or None,
+                        )
+
+        return Response(
+            {'id': project.id, 'name': project.name, 'created': created},
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class ProjectDetailView(APIView):
+    def _get_project(self, project_name):
+        try:
+            return Project.objects.get(name=project_name)
+        except (Project.DoesNotExist, ValueError):
+            return None
+
+    def get(self, request, project_name):
+        project = self._get_project(project_name)
+        if project is None:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(_serialize_project(project), status=status.HTTP_200_OK)
+
+    def delete(self, request, project_name):
+        project = self._get_project(project_name)
+        if project is None:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+        project.categories.all().delete()
+        project.delete()
+        return Response({'success': True}, status=status.HTTP_200_OK)
+
+
+class OrderView(APIView):
+    def post(self, request):
+        project_name = str(request.data.get('project_name', '') or '').strip()
+        if not project_name:
+            return Response({'error': 'project_name is required'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            project = Project.objects.get(name=project_name)
+        except Project.DoesNotExist:
+            return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        first_name = str(request.data.get('first_name', '') or '').strip()
+        last_name = str(request.data.get('last_name', '') or '').strip()
+        email = str(request.data.get('email', '') or '').strip()
+        phone = str(request.data.get('phone', '') or '').strip()
+        address = str(request.data.get('address', '') or '').strip()
+        if not first_name or not last_name or not email or not address:
+            return Response(
+                {'error': 'first_name, last_name, email and address are required'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        items = request.data.get('items')
+        if not isinstance(items, list) or not items:
+            return Response({'error': 'items must be a non-empty list'}, status=status.HTTP_400_BAD_REQUEST)
+
+        parsed_items = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            product_id = item.get('product_id')
+            try:
+                product_id = int(product_id)
+            except (ValueError, TypeError):
+                continue
+            try:
+                quantity = int(item.get('quantity', 1) or 1)
+            except (ValueError, TypeError):
+                quantity = 1
+            if quantity < 1:
+                quantity = 1
+            parsed_items.append({'product_id': product_id, 'quantity': quantity})
+        if not parsed_items:
+            return Response({'error': 'No valid items provided'}, status=status.HTTP_400_BAD_REQUEST)
+
+        product_ids = [i['product_id'] for i in parsed_items]
+        products = Product.objects.select_related('category__project').filter(id__in=product_ids)
+        product_map = {p.id: p for p in products}
+
+        for item in parsed_items:
+            product = product_map.get(item['product_id'])
+            if product is None:
+                return Response(
+                    {'error': f"Product {item['product_id']} not found in project '{project_name}'"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if product.category.project_id != project.id:
+                return Response(
+                    {'error': f"Product {product.name} does not belong to project '{project_name}'"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if product.stock < item['quantity']:
+                return Response(
+                    {'error': f"Insufficient stock for '{product.name}' (available: {product.stock})"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        order = Order.objects.create(
+            project=project,
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            phone=phone,
+            address=address,
+            status='pending',
+        )
+        for item in parsed_items:
+            product = product_map[item['product_id']]
+            OrderLine.objects.create(order=order, product=product, quantity=item['quantity'])
+            product.stock -= item['quantity']
+            product.save(update_fields=['stock'])
+
+        return Response(
+            {'success': True, 'order_id': order.id, 'message': 'Order created successfully.'},
+            status=status.HTTP_201_CREATED,
+        )

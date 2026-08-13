@@ -71,7 +71,12 @@ class Section(models.Model):
     SECTION_TYPES = [
         ('hero', 'Hero Banner'),
         ('columns', 'Feature Columns'),
+        ('gallery', 'Photo Gallery'),
+        ('testimonials', 'Testimonials'),
+        ('stats', 'Stats & Metrics'),
         ('overlay', 'Background Overlay'),
+        ('navbar', 'Navigation Bar'),
+        ('footer', 'Footer'),
     ]
     id = models.CharField(max_length=64, primary_key=True, default=default_section_id)
     section_type = models.CharField(max_length=20, choices=SECTION_TYPES)
@@ -99,3 +104,65 @@ class BackgroundOverlay(models.Model):
     font_size = models.CharField(max_length=10, choices=FONT_SIZES, default='lg')
     text_color = models.CharField(max_length=20, default='#ffffff')
     font_family = models.CharField(max_length=20, choices=FONT_FAMILIES, default='sans-serif')
+
+
+class Project(models.Model):
+    """Projet nommé : contient le thème, toutes les sections (8 types) et le prompt d'origine."""
+    name = models.CharField(max_length=255, unique=True)
+    theme = models.JSONField(default=dict, blank=True)
+    sections = models.JSONField(default=list, blank=True)  # Holds all 8 section types safely
+    original_prompt = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Category(models.Model):
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='categories')
+    name = models.CharField(max_length=100)
+
+    def __str__(self):
+        return self.name
+
+
+class Product(models.Model):
+    category = models.ForeignKey(Category, on_delete=models.CASCADE, related_name='products')
+    name = models.CharField(max_length=255)
+    price = models.CharField(max_length=50)
+    description = models.TextField(blank=True, null=True)
+    stock = models.IntegerField(default=0)
+    image_url = models.URLField(max_length=1000, blank=True, null=True)
+
+    def __str__(self):
+        return self.name
+
+
+class Order(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending'),
+        ('paid', 'Paid'),
+        ('shipped', 'Shipped'),
+        ('cancelled', 'Cancelled'),
+    ]
+    project = models.ForeignKey(Project, on_delete=models.CASCADE, related_name='orders')
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    email = models.EmailField()
+    phone = models.CharField(max_length=50)
+    address = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name} - {self.project.name}"
+
+
+class OrderLine(models.Model):
+    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name='lines')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE)
+    quantity = models.IntegerField(default=1)
+
+    def __str__(self):
+        return f"{self.quantity}x {self.product.name}"

@@ -1,259 +1,423 @@
 import json
 import os
-import traceback
 
-from google.api_core.client_options import ClientOptions
+import requests
+
 import google.generativeai as genai
 
-# Modern active model identifier
+from .prompts import SYSTEM_PROMPT, CHATBOT_SYSTEM_PROMPT, DEFAULT_TITLES, DEFAULT_KEYWORDS
+from .fallbacks import generate_smart_fallback, _fallback_catalog, _navbar_section, _footer_section
+from .image_service import get_stock_image_url, _stock_url
+
+# Modern active model identifier (used when USE_OLLAMA_FOR_GENERATION is False)
 GEMINI_MODEL = 'gemini-3.6-flash'
 
-SYSTEM_PROMPT = """
-Tu es un directeur artistique et développeur expert en création de sites web one-page. À partir de la demande de l'utilisateur en français, tu génères une configuration JSON valide qui correspond EXACTEMENT à ce schéma :
+# Toggle website generation between local Ollama and Gemini API
+USE_OLLAMA_FOR_GENERATION = True
 
-{
-  "hero_first": true ou false (true = la bannière est en haut, false = les colonnes sont en haut),
-  "hero_type": "image" ou "text",
-  "hero_title": "titre français accrocheur pour l'entreprise ou le sujet",
-  "hero_subtitle": "sous-titre français persuasif",
-  "hero_text_color": "code HEX valide pour le texte de la bannière (ex: #ffffff, #f8fafc, #fef08a)",
-  "hero_font_family": "choisis parmi : 'sans-serif' (moderne/tech), 'serif' (classique/luxe), ou 'monospace' (code/créatif)",
-  "hero_font_size": "'sm', 'md', 'lg' ou 'xl' selon l'impact visuel souhaité",
-  "column_count": nombre entier (1, 2, 3 ou 4),
-  "columns": [
-    {
-      "position": nombre entier (1 à 4),
-      "content_type": "both" | "image_only" | "text_only",
-      "text": "description française pertinente pour cette section"
-    }
-  ],
-  "section_order": ["hero", "columns", "overlay"] (ordonne CES EXACTEMENT 3 chaînes de manière logique selon l'objectif du site),
-  "overlay_title": "titre impactant pour la section de mise en valeur (call-to-action)",
-  "overlay_subtitle": "sous-titre persuasif ou slogan de conclusion",
-  "overlay_text_color": "code HEX valide pour le texte de l'overlay (ex: #ffffff, #f8fafc, #fef08a)",
-  "overlay_font_family": "choisis parmi : 'sans-serif' (moderne/tech), 'serif' (classique/artisan/juridique/luxe), ou 'monospace' (code/créatif)"
+# Local Ollama models (used for website generation and the e-commerce chatbot)
+OLLAMA_MODEL = "qwen2.5-coder:7b"
+OLLAMA_API_URL = "http://localhost:11434/api/chat"
+
+# --- Section model ---
+VALID_SECTION_TYPES = {"hero", "columns", "gallery", "testimonials", "stats", "overlay", "navbar", "footer"}
+
+LAYOUT_STYLES = {
+    "hero": {"centered_bg", "split_50_50", "minimal_text"},
+    "columns": {"grid_cards", "asymmetric_featured", "alternating_rows"},
+    "gallery": {"masonry_grid", "row_grid"},
+    "testimonials": {"quote_cards", "full_width_quote"},
+    "stats": {"metric_grid", "banner_stats"},
+    "overlay": {"full_bg_banner", "split_cta"},
 }
 
-Règles importantes et liberté créative :
-- Réponds UNIQUEMENT avec un objet JSON valide, sans texte supplémentaire, sans commentaires, sans backticks ni balises.
-- Agencement dynamique (section_order) : Choisis l'ordre d'affichage des 3 sections ("hero", "columns", "overlay") le plus adapté au sujet. Par exemple, pour un site promotionnel urgent, tu peux placer "overlay" en deuxième.
-- Typographie et Couleur : Déduis l'ambiance visuelle du sujet. Utilise une police "serif" élégante pour un cabinet d'avocats, une boulangerie ou du luxe, et "sans-serif" pour une agence ou une startup. Choisis des couleurs HEX claires (#ffffff, #f8fafc, #fef08a) bien lisibles sur fond sombre, tant pour la bannière (hero) que pour l'overlay.
-- hero_first : true par défaut (bannière en haut), sauf si la demande suggère clairement le contraire.
-- column_count : choisis entre 1 et 4 selon le nombre de spécialités/sections mentionnées (2 ou 3 par défaut si non précisé).
-- Textes : Tous les textes (hero, colonnes, overlay) doivent être rédigés en français, naturels, professionnels et attractifs.
-- Le JSON doit être parfaitement formé et parsable par json.loads.
-"""
+CONTENT_TYPES = {"both", "image_only", "text_only"}
 
 
-def generate_smart_fallback(prompt: str) -> dict:
-    """Génère un agencement dynamique basé sur les mots-clés si l'API est indisponible."""
-    p = prompt.lower() if prompt else ""
+def _default_layout(sec_type: str) -> str:
+    return sorted(LAYOUT_STYLES.get(sec_type, set()))[0]
 
-    # Détection du nombre de colonnes
-    if "1 colonne" in p or "une colonne" in p:
-        column_count = 1
-    elif "2 colonnes" in p or "deux colonnes" in p:
-        column_count = 2
-    elif "4 colonnes" in p or "quatre colonnes" in p:
-        column_count = 4
-    else:
-        column_count = 3
 
-    # Détection du type de héros et disposition
-    hero_type = "image" if ("image" in p or "photo" in p or "bannière" in p) else "text"
-    hero_first = False if ("colonnes en haut" in p or "colonnes en premier" in p) else True
+def _normalize_catalog(data):
+    """Extrait et normalise le catalogue {name, products} depuis la réponse Gemini."""
+    raw = data.get("catalog") if isinstance(data, dict) else None
+    if not isinstance(raw, list):
+        return None
+    catalog = []
+    for cat in raw:
+        if not isinstance(cat, dict):
+            continue
+        name = str(cat.get("name", "") or "").strip()
+        products = []
+        raw_products = cat.get("products")
+        if isinstance(raw_products, list):
+            for prod in raw_products:
+                if not isinstance(prod, dict):
+                    continue
+                pname = str(prod.get("name", "") or "").strip()
+                if not pname:
+                    continue
+                keyword = str(prod.get("image_keyword", "") or "").strip() or "product"
+                pname_display = pname
+                stock_raw = prod.get("stock")
+                try:
+                    stock = int(stock_raw) if stock_raw is not None else 0
+                except (ValueError, TypeError):
+                    stock = 0
+                products.append({
+                    "name": pname,
+                    "price": str(prod.get("price", "") or "").strip() or "Prix sur demande",
+                    "image_keyword": keyword,
+                    "image_url": get_stock_image_url(keyword, 800, 800),
+                    "description": str(prod.get("description", "") or "").strip() or f"{pname_display}. Un produit de qualité sélectionné pour vous.",
+                    "stock": stock,
+                })
+        if name and products:
+            catalog.append({"name": name, "products": products})
+    return catalog if catalog else None
 
-    # Détection de la thématique (textes + direction artistique)
-    if any(k in p for k in ["boulangerie", "pâtisserie", "pain"]):
-        hero_title = "Boulangerie Artisanale & Pâtisserie"
-        hero_subtitle = "Le goût authentique du pain frais et des viennoiseries faites maison."
-        hero_text_color = "#fef08a"
-        hero_font_family = "serif"
-        hero_font_size = "xl"
-        overlay_title = "Commandez Vos Créations Pâtissières"
-        overlay_subtitle = "Une envie particulière pour votre événement ? Contactez nos artisans."
-        overlay_font_family = "serif"
-        overlay_text_color = "#fef08a"
-        section_order = ["hero", "columns", "overlay"]
-        col_texts = [
-            "Pains Traditionnels : Fabriqués chaque matin avec des farines locales et au levain naturel.",
-            "Viennoiseries : Croissants au beurre AOP et pains au chocolat croustillants.",
-            "Gâteaux & Tartes : Des créations gourmandes pour tous vos événements d'exception.",
-            "Service Traiteur : Vos pièces montées et buffets sucrés sur commande.",
-        ]
-    elif any(k in p for k in ["avocat", "juridique", "cabinet", "droit"]):
-        hero_title = "Cabinet d'Avocats & Conseil Juridique"
-        hero_subtitle = "Un accompagnement rigoureux et personnalisé pour tous vos besoins juridiques."
-        hero_text_color = "#ffffff"
-        hero_font_family = "serif"
-        hero_font_size = "xl"
-        overlay_title = "Une Urgence Juridique ?"
-        overlay_subtitle = "Prenez rendez-vous en ligne avec l'un de nos associés."
-        overlay_font_family = "serif"
-        overlay_text_color = "#ffffff"
-        section_order = ["hero", "columns", "overlay"]
-        col_texts = [
-            "Droit des Affaires : Conseil et accompagnement des entreprises et dirigeants.",
-            "Droit Immobilier : Baux, transactions et contentieux immobiliers.",
-            "Droit du Travail : Défense des salariés et assistance aux employeurs.",
-            "Gestion des Contentieux : Représentation devant toutes les juridictions.",
-        ]
-    elif any(k in p for k in ["pizza", "restaurant", "cuisine", "italien"]):
-        hero_title = "Restaurant & Pizzeria Gourmande"
-        hero_subtitle = "Des ingrédients frais et des recettes traditionnelles préparées avec passion."
-        hero_text_color = "#fef08a"
-        hero_font_family = "serif"
-        hero_font_size = "xl"
-        overlay_title = "Réservez Votre Table Dès Maintenant"
-        overlay_subtitle = "Une soirée inoubliable autour de la gastronomie italienne vous attend."
-        overlay_font_family = "serif"
-        overlay_text_color = "#fef08a"
-        section_order = ["hero", "columns", "overlay"]
-        col_texts = [
-            "Plats du Jour : Une cuisine de saison élaborée à partir de produits frais.",
-            "Pizzas au Feu de Bois : Pâte artisanale maturée 48h et garnitures savoureuses.",
-            "Desserts Maison : Tiramisu traditionnel, panna cotta et tartes de la maison.",
-            "Réservations : Réservez votre table en ligne pour vos dîners et événements.",
-        ]
-    else:
-        hero_title = "Bienvenue sur notre site web"
-        hero_subtitle = "Découvrez nos services sur mesure et notre savoir-faire d'exception."
-        hero_text_color = "#ffffff"
-        hero_font_family = "sans-serif"
-        hero_font_size = "xl"
-        overlay_title = "Prêt à Lancer Votre Projet ?"
-        overlay_subtitle = "Discutons de vos ambitions et construisons ensemble votre succès."
-        overlay_font_family = "sans-serif"
-        overlay_text_color = "#ffffff"
-        section_order = ["hero", "columns", "overlay"]
-        col_texts = [
-            "Présentation : Découvrez notre équipe passionnée et notre savoir-faire unique.",
-            "Nos Services : Des solutions sur mesure adaptées à tous vos projets.",
-            "Engagement Qualité : Une exigence constante pour votre entière satisfaction.",
-            "Contact : Contactez-nous dès aujourd'hui pour obtenir votre devis personnalisé.",
-        ]
 
-    columns = []
-    for i in range(1, column_count + 1):
-        columns.append({
-            "position": i,
-            "content_type": "both",
-            "text": col_texts[i - 1] if i - 1 < len(col_texts) else f"Section {i} : Description personnalisée pour votre projet.",
-        })
-
+def _hero_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["hero"]:
+        style = _default_layout("hero")
+    keyword = str(data.get("image_keyword", "") or "").strip() or DEFAULT_KEYWORDS["hero"]
     return {
-        "hero_first": hero_first,
-        "hero_type": hero_type,
-        "hero_title": hero_title,
-        "hero_subtitle": hero_subtitle,
-        "hero_text_color": hero_text_color,
-        "hero_font_family": hero_font_family,
-        "hero_font_size": hero_font_size,
-        "column_count": column_count,
-        "columns": columns,
-        "section_order": section_order,
-        "overlay_title": overlay_title,
-        "overlay_subtitle": overlay_subtitle,
-        "overlay_text_color": overlay_text_color,
-        "overlay_font_family": overlay_font_family,
+        "id": sec_id,
+        "type": "hero",
+        "layout_style": style,
+        "title": str(data.get("title", "") or DEFAULT_TITLES["hero"]),
+        "subtitle": str(data.get("subtitle", "") or ""),
+        "cta_text": str(data.get("cta_text", "") or "Contactez-nous"),
+        "image_keyword": keyword,
+        "image_url": _stock_url(keyword, 1600, 900),
     }
 
 
-def _normalize_config(data):
-    try:
-        hero_type = data.get('hero_type', 'image')
-        if hero_type not in ('image', 'text'):
-            hero_type = 'image'
+def _overlay_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["overlay"]:
+        style = _default_layout("overlay")
+    keyword = str(data.get("image_keyword", "") or "").strip() or DEFAULT_KEYWORDS["overlay"]
+    return {
+        "id": sec_id,
+        "type": "overlay",
+        "layout_style": style,
+        "title": str(data.get("title", "") or DEFAULT_TITLES["overlay"]),
+        "subtitle": str(data.get("subtitle", "") or ""),
+        "cta_text": str(data.get("cta_text", "") or "Découvrir"),
+        "image_keyword": keyword,
+        "image_url": _stock_url(keyword, 1600, 900),
+    }
 
-        try:
-            column_count = int(data.get('column_count', 3))
-        except (TypeError, ValueError):
-            column_count = 3
-        column_count = max(1, min(4, column_count))
 
-        columns_raw = data.get('columns') or []
-        columns = []
-        for i in range(1, column_count + 1):
-            entry = next((c for c in columns_raw if c.get('position') == i), {})
-            content_type = entry.get('content_type', 'both')
-            if content_type not in ('both', 'image_only', 'text_only'):
-                content_type = 'both'
+def _columns_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["columns"]:
+        style = _default_layout("columns")
+    raw_columns = data.get("columns")
+    if not isinstance(raw_columns, list):
+        raw_columns = []
+    columns = []
+    for c in raw_columns:
+        if not isinstance(c, dict):
+            continue
+        content_type = str(c.get("content_type", "both")).strip()
+        if content_type not in CONTENT_TYPES:
+            content_type = "both"
+        keyword = str(c.get("image_keyword", "") or "").strip() or DEFAULT_KEYWORDS["columns"]
+        columns.append({
+            "title": str(c.get("title", "") or ""),
+            "text": str(c.get("text", "") or ""),
+            "content_type": content_type,
+            "image_keyword": keyword,
+            "image_url": _stock_url(keyword, 800, 600),
+        })
+    if style == "asymmetric_featured":
+        while len(columns) < 3:
+            keyword = DEFAULT_KEYWORDS["columns"]
             columns.append({
-                'position': i,
-                'content_type': content_type,
-                'text': str(entry.get('text', '')),
+                "title": f"Section {len(columns) + 1}",
+                "text": "",
+                "content_type": "both",
+                "image_keyword": keyword,
+                "image_url": _stock_url(keyword, 800, 600),
             })
+    return {
+        "id": sec_id,
+        "type": "columns",
+        "layout_style": style,
+        "title": str(data.get("title", "") or ""),
+        "subtitle": str(data.get("subtitle", "") or ""),
+        "columns": columns,
+    }
 
-        # --- VALIDATION DE LA LIBERTÉ CRÉATIVE ---
-        # 1. Validation de l'ordre des sections (doit contenir exactement les 3 sections)
-        valid_sections = {"hero", "columns", "overlay"}
-        raw_order = data.get('section_order', ["hero", "columns", "overlay"])
-        if not isinstance(raw_order, list) or set(raw_order) != valid_sections:
-            section_order = ["hero", "columns", "overlay"]
-        else:
-            section_order = raw_order
 
-        # 2. Validation de la police de caractère (hero + overlay)
-        hero_font_family = str(data.get('hero_font_family', 'sans-serif')).lower()
-        if hero_font_family not in ('sans-serif', 'serif', 'monospace', 'playfair'):
-            hero_font_family = 'sans-serif'
-        font_family = str(data.get('overlay_font_family', 'sans-serif')).lower()
-        if font_family not in ('sans-serif', 'serif', 'monospace'):
-            font_family = 'sans-serif'
+def _gallery_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["gallery"]:
+        style = _default_layout("gallery")
+    raw_items = data.get("items")
+    if not isinstance(raw_items, list):
+        raw_items = []
+    items = []
+    for it in raw_items:
+        if not isinstance(it, dict):
+            continue
+        keyword = str(it.get("image_keyword", "") or "").strip() or DEFAULT_KEYWORDS["gallery"]
+        items.append({
+            "title": str(it.get("title", "") or ""),
+            "image_keyword": keyword,
+            "image_url": _stock_url(keyword, 800, 600),
+        })
+    return {
+        "id": sec_id,
+        "type": "gallery",
+        "layout_style": style,
+        "title": str(data.get("title", "") or ""),
+        "subtitle": str(data.get("subtitle", "") or ""),
+        "items": items,
+    }
 
-        # 2bis. Validation de la taille de police (hero)
-        hero_font_size = str(data.get('hero_font_size', 'xl')).lower()
-        if hero_font_size not in ('sm', 'md', 'lg', 'xl'):
-            hero_font_size = 'xl'
 
-        # 3. Validation du code couleur HEX
-        hero_text_color = str(data.get('hero_text_color', '#ffffff')).strip()
-        if not (hero_text_color.startswith('#') and len(hero_text_color) in (4, 7)):
-            hero_text_color = '#ffffff'
-        text_color = str(data.get('overlay_text_color', '#ffffff')).strip()
-        if not (text_color.startswith('#') and len(text_color) in (4, 7)):
-            text_color = '#ffffff'
+def _testimonials_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["testimonials"]:
+        style = _default_layout("testimonials")
+    raw_reviews = data.get("reviews")
+    if not isinstance(raw_reviews, list):
+        raw_reviews = []
+    reviews = []
+    for r in raw_reviews:
+        if not isinstance(r, dict):
+            continue
+        reviews.append({
+            "quote": str(r.get("quote", "") or ""),
+            "author": str(r.get("author", "") or ""),
+            "role": str(r.get("role", "") or ""),
+        })
+    return {
+        "id": sec_id,
+        "type": "testimonials",
+        "layout_style": style,
+        "title": str(data.get("title", "") or ""),
+        "reviews": reviews,
+    }
 
-        return {
-            'hero_first': bool(data.get('hero_first', True)),
-            'hero_type': hero_type,
-            'hero_title': str(data.get('hero_title', '')),
-            'hero_subtitle': str(data.get('hero_subtitle', '')),
-            'hero_text_color': hero_text_color,
-            'hero_font_family': hero_font_family,
-            'hero_font_size': hero_font_size,
-            'column_count': column_count,
-            'columns': columns,
-            'section_order': section_order,
-            'overlay_title': str(data.get('overlay_title', 'Section de mise en valeur')),
-            'overlay_subtitle': str(data.get('overlay_subtitle', 'Découvrez nos engagements')),
-            'overlay_text_color': text_color,
-            'overlay_font_family': font_family,
+
+def _stats_section(data, sec_id):
+    style = str(data.get("layout_style", "")).strip()
+    if style not in LAYOUT_STYLES["stats"]:
+        style = _default_layout("stats")
+    raw_metrics = data.get("metrics")
+    if not isinstance(raw_metrics, list):
+        raw_metrics = []
+    metrics = []
+    for m in raw_metrics:
+        if not isinstance(m, dict):
+            continue
+        metrics.append({
+            "label": str(m.get("label", "") or ""),
+            "value": str(m.get("value", "") or ""),
+        })
+    return {
+        "id": sec_id,
+        "type": "stats",
+        "layout_style": style,
+        "title": str(data.get("title", "") or ""),
+        "metrics": metrics,
+    }
+
+
+def _normalize_config(data, prompt=""):
+    """Normalise la réponse Gemini (racine {theme, sections}) en config propre et riche en images."""
+    try:
+        if not isinstance(data, dict) or not isinstance(data.get("sections"), list) or not data["sections"]:
+            return generate_smart_fallback(prompt)
+
+        theme_raw = data.get("theme") if isinstance(data.get("theme"), dict) else {}
+        font_family = str(theme_raw.get("font_family", "sans-serif")).lower()
+        if font_family not in ("serif", "sans-serif", "monospace"):
+            font_family = "sans-serif"
+        border_radius = str(theme_raw.get("border_radius", "lg")).lower()
+        if border_radius not in ("none", "sm", "lg", "full"):
+            border_radius = "lg"
+        theme = {
+            "primary_color": str(theme_raw.get("primary_color", "#4f46e5")),
+            "secondary_color": str(theme_raw.get("secondary_color", "#06b6d4")),
+            "background_color": str(theme_raw.get("background_color", "#ffffff")),
+            "font_family": font_family,
+            "border_radius": border_radius,
         }
+
+        id_counts = {}
+        sections = []
+        for raw_sec in data["sections"]:
+            if not isinstance(raw_sec, dict):
+                continue
+            sec_type = str(raw_sec.get("type", "")).strip()
+            if sec_type not in VALID_SECTION_TYPES:
+                continue
+            id_counts[sec_type] = id_counts.get(sec_type, 0) + 1
+            sec_id = str(raw_sec.get("id", "")).strip() or f"{sec_type}_{id_counts[sec_type]}"
+
+            if sec_type == "hero":
+                sections.append(_hero_section(raw_sec, sec_id))
+            elif sec_type == "columns":
+                sections.append(_columns_section(raw_sec, sec_id))
+            elif sec_type == "gallery":
+                sections.append(_gallery_section(raw_sec, sec_id))
+            elif sec_type == "testimonials":
+                sections.append(_testimonials_section(raw_sec, sec_id))
+            elif sec_type == "stats":
+                sections.append(_stats_section(raw_sec, sec_id))
+            elif sec_type == "overlay":
+                sections.append(_overlay_section(raw_sec, sec_id))
+            elif sec_type == "navbar":
+                sections.append(_navbar_section(raw_sec, sec_id))
+            elif sec_type == "footer":
+                sections.append(_footer_section(raw_sec, sec_id))
+
+        if not sections:
+            return generate_smart_fallback(prompt)
+
+        catalog = _normalize_catalog(data)
+        if catalog is None:
+            catalog = _fallback_catalog(prompt)
+
+        return {"theme": theme, "sections": sections, "catalog": catalog}
     except Exception:
-        return generate_smart_fallback("")
+        return generate_smart_fallback(prompt)
 
 
 def generate_config(prompt):
-    api_key = os.environ.get('GEMINI_API_KEY')
-    if not api_key or api_key == 'default_mock_key':
-        return generate_smart_fallback(prompt)
+    if USE_OLLAMA_FOR_GENERATION:
+        try:
+            messages = [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ]
+            payload = {
+                "model": OLLAMA_MODEL,
+                "messages": messages,
+                "format": "json",
+                "stream": False,
+                "options": {"temperature": 0.0, "num_ctx": 8192},
+            }
+            response = requests.post(OLLAMA_API_URL, json=payload, timeout=150)
+            response.raise_for_status()
+            data = response.json()
+            content = data.get("message", {}).get("content", "")
+            parsed = json.loads(content)
+            print(f"[AI Service] Ollama model ({OLLAMA_MODEL}) generated response successfully!")
+            return _normalize_config(parsed, prompt)
+        except Exception as e:
+            print(f"[AI Service] Ollama generation unavailable ({type(e).__name__}): {str(e)}")
+            return generate_smart_fallback(prompt)
 
+    if not USE_OLLAMA_FOR_GENERATION:
+        api_key = os.environ.get('GEMINI_API_KEY')
+        if not api_key or api_key == 'default_mock_key':
+            return generate_smart_fallback(prompt)
+
+        try:
+            # Laissez le SDK gérer l'endpoint automatiquement par défaut
+            genai.configure(api_key=api_key)
+
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL,
+                system_instruction=SYSTEM_PROMPT,
+                generation_config=genai.GenerationConfig(
+                    response_mime_type="application/json",
+                    temperature=0.85,
+                    top_p=0.95,
+                ),
+            )
+            response = model.generate_content(prompt)
+            data = json.loads(response.text)
+            print(f"[AI Service] Live Gemini Model ({GEMINI_MODEL}) generated response successfully!")
+            return _normalize_config(data, prompt)
+        except Exception as e:
+            print(f" [AI Service] Gemini API unavailable ({type(e).__name__}): {str(e)}")
+            return generate_smart_fallback(prompt)
+
+
+def summarize_catalog_for_chat(catalog):
+    """Résume le catalogue en une chaîne compacte (sans descriptions ni images) pour réduire la taille du prompt."""
+    if not isinstance(catalog, list):
+        return ""
+    lines = []
+    for cat in catalog:
+        if not isinstance(cat, dict):
+            continue
+        cat_name = str(cat.get("name", "") or "").strip()
+        if cat_name:
+            lines.append(f"Catégorie: {cat_name}")
+        products = cat.get("products")
+        if isinstance(products, list):
+            for prod in products:
+                if not isinstance(prod, dict):
+                    continue
+                name = str(prod.get("name", "") or "").strip()
+                if not name:
+                    continue
+                price_raw = str(prod.get("price", "") or "").strip()
+                if price_raw.endswith("€"):
+                    price_raw = price_raw.rstrip("€").strip()
+                stock_raw = prod.get("stock")
+                try:
+                    stock = int(stock_raw) if stock_raw is not None else 0
+                except (ValueError, TypeError):
+                    stock = 0
+                lines.append(f"- {name} | {price_raw}€ | Stock: {stock}")
+    return "\n".join(lines)
+
+
+def handle_chat_message(project_name, catalog, message_history, user_message):
+    """Envoie le message utilisateur à un modèle Ollama local et retourne la réponse JSON parsée."""
+    catalog_text = summarize_catalog_for_chat(catalog)
+    system_prompt = CHATBOT_SYSTEM_PROMPT.format(catalog=catalog_text)
+
+    formatted_history = []
+    if isinstance(message_history, list):
+        for m in message_history:
+            if not isinstance(m, dict):
+                continue
+            sender = m.get("sender") or m.get("role")
+            text = m.get("text") or m.get("content")
+
+            if sender and text:
+                role = "assistant" if sender == "bot" else "user"
+                formatted_history.append({"role": role, "content": text})
+    messages = [{"role": "system", "content": system_prompt}] + formatted_history + [{"role": "user", "content": user_message}]
+
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": messages,
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.4, "num_ctx": 2048},
+    }
+    timeout_payload = {
+        "reply": "Désolé, la réponse prend plus de temps que prévu. Pouvez-vous reformuler ?",
+        "order_ready": False,
+        "order_details": {},
+    }
     try:
-        # Laissez le SDK gérer l'endpoint automatiquement par défaut
-        genai.configure(api_key=api_key)
-
-        model = genai.GenerativeModel(
-            model_name=GEMINI_MODEL,
-            system_instruction=SYSTEM_PROMPT,
-            generation_config=genai.GenerationConfig(
-                response_mime_type="application/json",
-            ),
-        )
-        response = model.generate_content(prompt)
-        data = json.loads(response.text)
-        print(f"[AI Service] Live Gemini Model ({GEMINI_MODEL}) generated response successfully!")
-        return _normalize_config(data)
-    except Exception as e:
-        print(f" [AI Service] Gemini API unavailable ({type(e).__name__}): {str(e)}")
-        return generate_smart_fallback(prompt)
+        response = requests.post(OLLAMA_API_URL, json=payload, timeout=90)
+        response.raise_for_status()
+    except (requests.exceptions.Timeout, requests.exceptions.RequestException):
+        return timeout_payload
+    data = response.json()
+    content = data.get("message", {}).get("content", "")
+    try:
+        parsed = json.loads(content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("reply"), str):
+        return {
+            "reply": "Je suis à votre disposition ! Souhaitez-vous des informations sur nos produits ou passer une commande ?",
+            "order_ready": False,
+            "order_details": {},
+        }
+    return parsed

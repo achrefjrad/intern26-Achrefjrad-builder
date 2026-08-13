@@ -42,14 +42,12 @@ export default function AssistantPage() {
         } catch {
           // Response body was not JSON; keep the generic message
         }
-        console.error("AI API Error:", res.status, message)
         setError(message)
         setStatus(null)
         return
       }
 
       const data = await res.json()
-      console.log("AI API Response:", data)
 
       localStorage.setItem("ai_generated_config", JSON.stringify({ ...data, original_prompt: prompt.trim() }))
       setStatus("Configuration générée ! Redirection vers l'éditeur...")
