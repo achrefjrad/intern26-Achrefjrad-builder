@@ -26,7 +26,7 @@ def _normalize_section_order(section_order):
     return items
 
 
-def save_sections(config, sections, files=None):
+def save_sections(config, sections):
     """Persiste une liste de sections [{id, type, data}] et met à jour section_order."""
     order = []
     for item in sections:
@@ -165,7 +165,7 @@ class ConfigView(APIView):
             if isinstance(sections, str):
                 sections = json.loads(sections)
             if isinstance(sections, list):
-                save_sections(config, sections, request.FILES)
+                save_sections(config, sections)
             if 'original_prompt' in request.data:
                 config.original_prompt = request.data['original_prompt']
                 config.save(update_fields=['original_prompt'])

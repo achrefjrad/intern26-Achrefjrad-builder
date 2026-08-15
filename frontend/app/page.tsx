@@ -21,10 +21,12 @@ import GallerySection from "@/components/GallerySection"
 import TestimonialsSection from "@/components/TestimonialsSection"
 import StatsSection from "@/components/StatsSection"
 
-const API_URL = "http://127.0.0.1:8000/api/config/"
-const GENERATE_URL = "http://127.0.0.1:8000/api/generate/"
-const UPLOAD_URL = "http://127.0.0.1:8000/api/upload-images/"
-const PROJECTS_URL = "http://127.0.0.1:8000/api/projects/"
+import { API_ENDPOINTS } from "@/lib/config"
+
+const API_URL = API_ENDPOINTS.config
+const GENERATE_URL = API_ENDPOINTS.generate
+const UPLOAD_URL = API_ENDPOINTS.uploadImages
+const PROJECTS_URL = API_ENDPOINTS.projects
 
 type SectionData =
   | HeroSectionData

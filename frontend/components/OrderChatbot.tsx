@@ -2,8 +2,10 @@
 
 import { useState, useRef, useCallback, useEffect, type FormEvent } from "react"
 
-const ORDERS_URL = "http://127.0.0.1:8000/api/orders/"
-const CHAT_URL = "http://127.0.0.1:8000/api/chat/"
+import { API_ENDPOINTS } from "@/lib/config"
+
+const ORDERS_URL = API_ENDPOINTS.orders
+const CHAT_URL = API_ENDPOINTS.chat
 
 type ProductData = {
   id?: number

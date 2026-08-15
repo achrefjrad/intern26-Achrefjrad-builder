@@ -3,7 +3,9 @@
 import { useState } from "react"
 import { useRouter } from "next/navigation"
 
-const API_URL = "http://127.0.0.1:8000/api/generate/"
+import { API_ENDPOINTS } from "@/lib/config"
+
+const API_URL = API_ENDPOINTS.generate
 
 const EXAMPLES = [
   "Site pour une boulangerie artisanale à Lyon avec 3 colonnes pour nos spécialités",

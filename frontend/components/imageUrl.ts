@@ -1,4 +1,6 @@
-const API_ORIGIN = "http://127.0.0.1:8000"
+import { API_BASE_URL } from "@/lib/config"
+
+const API_ORIGIN = API_BASE_URL
 
 export const getImageUrl = (path: string): string => {
   if (!path) return ""
