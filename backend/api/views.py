@@ -65,13 +65,14 @@ class ChatView(APIView):
         catalog = request.data.get('catalog')
         message_history = request.data.get('message_history', [])
         user_message = str(request.data.get('user_message', '') or '').strip()
+        order_state = request.data.get('order_state', {})
         if not user_message:
             return Response(
                 {'error': 'user_message is required'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         try:
-            result = handle_chat_message(project_name, catalog, message_history, user_message)
+            result = handle_chat_message(project_name, catalog, message_history, user_message, order_state)
         except Exception as e:
             return Response(
                 {'error': f'Ollama unavailable ({type(e).__name__}): {str(e)}'},
@@ -439,14 +440,20 @@ class OrderView(APIView):
         except Project.DoesNotExist:
             return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
 
+        name = str(request.data.get('name', '') or '').strip()
         first_name = str(request.data.get('first_name', '') or '').strip()
         last_name = str(request.data.get('last_name', '') or '').strip()
         email = str(request.data.get('email', '') or '').strip()
         phone = str(request.data.get('phone', '') or '').strip()
         address = str(request.data.get('address', '') or '').strip()
+        if not first_name and not last_name and name:
+            parts = name.split()
+            if parts:
+                first_name = parts[0]
+                last_name = ' '.join(parts[1:]) if len(parts) > 1 else parts[0]
         if not first_name or not last_name or not email or not address:
             return Response(
-                {'error': 'first_name, last_name, email and address are required'},
+                {'error': 'name (prénom et nom), email and address are required'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
