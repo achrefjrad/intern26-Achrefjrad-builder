@@ -1,4 +1,4 @@
-import json
+﻿import json
 import os
 
 from django.core.files.storage import default_storage
@@ -9,6 +9,7 @@ from .models import WebsiteConfig, Column, BackgroundOverlay, Section, Project, 
 from .ai_service import generate_config, handle_chat_message
 
 VALID_SECTION_TYPES = {'hero', 'columns', 'gallery', 'testimonials', 'stats', 'overlay', 'navbar', 'footer'}
+DEFAULT_DRAFT_PROJECT_NAME = "__draft__"
 
 
 def _normalize_section_order(section_order):
@@ -45,6 +46,7 @@ def save_sections(config, sections):
         config.section_order = order
         config.save(update_fields=['section_order'])
 
+
 class GenerateView(APIView):
     def post(self, request):
         prompt = request.data.get('prompt', '')
@@ -54,8 +56,22 @@ class GenerateView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         config = generate_config(prompt)
-        WebsiteConfig.objects.get_or_create(id=1)
-        WebsiteConfig.objects.filter(id=1).update(original_prompt=prompt)
+
+        # Update the modern draft Project
+        draft_project, _ = Project.objects.get_or_create(
+            name=DEFAULT_DRAFT_PROJECT_NAME,
+            defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+        )
+        draft_project.original_prompt = prompt
+        draft_project.save(update_fields=['original_prompt'])
+
+        # Transitional legacy mirror (until Stage 2 model removal)
+        try:
+            WebsiteConfig.objects.get_or_create(id=1)
+            WebsiteConfig.objects.filter(id=1).update(original_prompt=prompt)
+        except Exception:
+            pass
+
         return Response({**config, 'original_prompt': prompt}, status=status.HTTP_200_OK)
 
 
@@ -80,34 +96,39 @@ class ChatView(APIView):
             )
         return Response(result, status=status.HTTP_200_OK)
 
-def build_legacy_view(config, sections):
+
+def build_legacy_view(project_or_config, sections):
     """Construit les champs hérités (hero_banner, columns, overlay) depuis les sections."""
-    if not config:
+    if not project_or_config:
         return {'hero_banner': None, 'columns': [], 'overlay': None}
 
     def first_data(section_type):
         for sec in sections:
-            if sec['type'] == section_type:
-                return sec['data']
-        return None
+            if isinstance(sec, dict) and sec.get('type') == section_type:
+                return sec.get('data') or {}
+        return {}
 
-    hero = first_data('hero') or {}
-    cols = first_data('columns') or {}
-    overlay = first_data('overlay') or {}
+    hero = first_data('hero')
+    cols = first_data('columns')
+    overlay = first_data('overlay')
 
     columns_data = []
     for col in cols.get('columns') or []:
-        columns_data.append({
-            'id': col.get('position'),
-            'position': col.get('position'),
-            'content_type': col.get('content_type', 'both'),
-            'image': col.get('image') or '',
-            'images': col.get('images') or [],
-            'text': col.get('text') or '',
-        })
+        if isinstance(col, dict):
+            columns_data.append({
+                'id': col.get('position'),
+                'position': col.get('position'),
+                'content_type': col.get('content_type', 'both'),
+                'image': col.get('image') or '',
+                'images': col.get('images') or [],
+                'text': col.get('text') or '',
+            })
+
+    prompt = getattr(project_or_config, 'original_prompt', '') or ''
+    project_id = getattr(project_or_config, 'id', 1)
 
     hero_banner = {
-        'id': config.id,
+        'id': project_id,
         'hero_type': hero.get('hero_type', 'image'),
         'hero_images': hero.get('hero_images') or [],
         'hero_title': hero.get('hero_title', ''),
@@ -117,10 +138,10 @@ def build_legacy_view(config, sections):
         'hero_font_size': hero.get('hero_font_size', 'xl'),
         'column_count': cols.get('column_count', 4),
         'hero_first': True,
-        'section_order': [{'id': s['id'], 'type': s['type']} for s in sections],
-        'original_prompt': config.original_prompt or '',
+        'section_order': [{'id': s['id'], 'type': s['type']} for s in sections if isinstance(s, dict) and 'id' in s and 'type' in s],
+        'original_prompt': prompt,
         'overlay': {
-            'id': config.id,
+            'id': project_id,
             'bg_image': (overlay.get('images') or [''])[0],
             'overlay_images': overlay.get('images') or [],
             'title': overlay.get('title', ''),
@@ -135,130 +156,107 @@ def build_legacy_view(config, sections):
 
 class ConfigView(APIView):
     def get(self, request):
-        config = WebsiteConfig.objects.first()
-        if config is None:
-            return Response({'sections': [], 'hero_banner': None, 'columns': [], 'overlay': None})
-
-        order = _normalize_section_order(config.section_order)
-        sections = []
-        if order:
-            section_map = {s.id: s for s in Section.objects.all()}
-            for item in order:
-                sec = section_map.get(item['id'])
-                if sec:
-                    sections.append({'id': sec.id, 'type': sec.section_type, 'data': sec.data})
-                else:
-                    sections.append({'id': item['id'], 'type': item['type'], 'data': {}})
-        else:
-            all_sections = Section.objects.all()
-            for sec in all_sections:
-                sections.append({'id': sec.id, 'type': sec.section_type, 'data': sec.data})
-
-        legacy = build_legacy_view(config, sections)
-        return Response({'sections': sections, **legacy})
+        project, _ = Project.objects.get_or_create(
+            name=DEFAULT_DRAFT_PROJECT_NAME,
+            defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+        )
+        sections = project.sections if isinstance(project.sections, list) else []
+        legacy = build_legacy_view(project, sections)
+        return Response({
+            'id': project.id,
+            'name': project.name,
+            'theme': project.theme or {},
+            'sections': sections,
+            'original_prompt': project.original_prompt or '',
+            'catalog': [
+                {
+                    'id': cat.id,
+                    'name': cat.name,
+                    'products': _project_products(cat),
+                }
+                for cat in project.categories.all()
+            ],
+            **legacy,
+        })
 
     def post(self, request):
-        config, _ = WebsiteConfig.objects.get_or_create(id=1)
+        project, _ = Project.objects.get_or_create(
+            name=DEFAULT_DRAFT_PROJECT_NAME,
+            defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+        )
 
         if 'sections' in request.data:
             sections = request.data['sections']
             if isinstance(sections, str):
-                sections = json.loads(sections)
+                try:
+                    sections = json.loads(sections)
+                except Exception:
+                    sections = []
             if isinstance(sections, list):
-                save_sections(config, sections)
-            if 'original_prompt' in request.data:
-                config.original_prompt = request.data['original_prompt']
-                config.save(update_fields=['original_prompt'])
-            return self.get(request)
+                project.sections = sections
 
-        # --- Chemin hérité (champs plats) ---
-        if 'hero_type' in request.data:
-            config.hero_type = request.data['hero_type']
-        if 'hero_images' in request.data:
-            hero_images = request.data['hero_images']
-            if isinstance(hero_images, str):
-                hero_images = json.loads(hero_images)
-            if isinstance(hero_images, list):
-                config.hero_images = hero_images[:3]
-        if 'hero_image' in request.FILES:
-            img = request.FILES['hero_image']
-            images = list(config.hero_images or [])
-            images.append(default_storage.save(os.path.join('hero', img.name), img))
-            config.hero_images = images[:3]
-        if 'hero_title' in request.data:
-            config.hero_title = request.data['hero_title']
-        if 'hero_subtitle' in request.data:
-            config.hero_subtitle = request.data['hero_subtitle']
-        if 'hero_text_color' in request.data:
-            config.hero_text_color = request.data['hero_text_color']
-        if 'hero_font_family' in request.data:
-            config.hero_font_family = request.data['hero_font_family']
-        if 'hero_font_size' in request.data:
-            config.hero_font_size = request.data['hero_font_size']
-        column_count = int(request.data.get('column_count', 4))
-        config.column_count = column_count
-        if 'hero_first' in request.data:
-            config.hero_first = request.data['hero_first'] in ('true', 'True', '1', 'on')
-        if 'section_order' in request.data:
-            section_order = request.data['section_order']
-            if isinstance(section_order, str):
-                section_order = json.loads(section_order)
-            if isinstance(section_order, list):
-                config.section_order = section_order
+        if 'theme' in request.data:
+            theme = request.data['theme']
+            if isinstance(theme, str):
+                try:
+                    theme = json.loads(theme)
+                except Exception:
+                    theme = {}
+            if isinstance(theme, dict):
+                project.theme = theme
+
         if 'original_prompt' in request.data:
-            config.original_prompt = request.data['original_prompt']
-        config.save()
+            project.original_prompt = str(request.data['original_prompt'] or '')
 
-        for i in range(1, column_count + 1):
-            col, _ = Column.objects.get_or_create(position=i)
-            content_type_key = f'column_{i}_content_type'
-            img_key = f'column_{i}_image'
-            text_key = f'column_{i}_text'
-            images_key = f'column_{i}_images'
-            if content_type_key in request.data:
-                col.content_type = request.data[content_type_key]
-            if img_key in request.FILES:
-                col.image = request.FILES[img_key]
-            if images_key in request.data:
-                col_images = request.data[images_key]
-                if isinstance(col_images, str):
-                    col_images = json.loads(col_images)
-                if isinstance(col_images, list):
-                    col.images = col_images
-            k = 0
-            while f'column_{i}_image_{k}' in request.FILES:
-                file_key = f'column_{i}_image_{k}'
-                img = request.FILES[file_key]
-                saved = default_storage.save(os.path.join('columns', str(i), img.name), img)
-                col.images = list(col.images or []) + [saved]
-                k += 1
-            if text_key in request.data:
-                col.text = request.data[text_key]
-            col.save()
+        if 'catalog' in request.data:
+            catalog = request.data['catalog']
+            if isinstance(catalog, str):
+                try:
+                    catalog = json.loads(catalog)
+                except Exception:
+                    catalog = None
+            if isinstance(catalog, list):
+                project.categories.all().delete()
+                for cat in catalog:
+                    if not isinstance(cat, dict):
+                        continue
+                    cat_name = str(cat.get('name', '') or '').strip()
+                    if not cat_name:
+                        continue
+                    category = Category.objects.create(project=project, name=cat_name)
+                    products = cat.get('products')
+                    if isinstance(products, list):
+                        for prod in products:
+                            if not isinstance(prod, dict):
+                                continue
+                            prod_name = str(prod.get('name', '') or '').strip()
+                            if not prod_name:
+                                continue
+                            try:
+                                stock = int(prod.get('stock', 0) or 0)
+                            except (ValueError, TypeError):
+                                stock = 0
+                            Product.objects.create(
+                                category=category,
+                                name=prod_name,
+                                price=str(prod.get('price', '') or ''),
+                                description=str(prod.get('description', '') or '') or None,
+                                stock=stock,
+                                image_url=str(prod.get('image_url', '') or '') or None,
+                            )
 
-        existing_positions = set(range(1, column_count + 1))
-        Column.objects.exclude(position__in=existing_positions).delete()
+        project.save()
 
-        overlay, _ = BackgroundOverlay.objects.get_or_create(config=config)
-        if 'bg_image' in request.FILES:
-            overlay.bg_image = request.FILES['bg_image']
-        if 'overlay_images' in request.data:
-            overlay_images = request.data['overlay_images']
-            if isinstance(overlay_images, str):
-                overlay_images = json.loads(overlay_images)
-            if isinstance(overlay_images, list):
-                overlay.overlay_images = overlay_images[:3]
-        if 'overlay_title' in request.data:
-            overlay.title = request.data['overlay_title']
-        if 'overlay_subtitle' in request.data:
-            overlay.subtitle = request.data['overlay_subtitle']
-        if 'overlay_font_size' in request.data:
-            overlay.font_size = request.data['overlay_font_size']
-        if 'overlay_text_color' in request.data:
-            overlay.text_color = request.data['overlay_text_color']
-        if 'overlay_font_family' in request.data:
-            overlay.font_family = request.data['overlay_font_family']
-        overlay.save()
+        # Transitional legacy mirror (until Stage 2 model removal)
+        try:
+            config, _ = WebsiteConfig.objects.get_or_create(id=1)
+            if isinstance(project.sections, list) and project.sections:
+                save_sections(config, project.sections)
+            if project.original_prompt:
+                config.original_prompt = project.original_prompt
+                config.save(update_fields=['original_prompt'])
+        except Exception:
+            pass
 
         return self.get(request)
 
@@ -345,7 +343,7 @@ class ProjectView(APIView):
                 return Response({'error': 'Project not found'}, status=status.HTTP_404_NOT_FOUND)
             return Response(_serialize_project(project), status=status.HTTP_200_OK)
 
-        projects = Project.objects.order_by('-updated_at')
+        projects = Project.objects.exclude(name=DEFAULT_DRAFT_PROJECT_NAME).order_by('-updated_at')
         return Response([
             {
                 'id': p.id,
