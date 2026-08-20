@@ -210,75 +210,6 @@ export const normalizeAiSection = (raw: AiSection): SectionInstance | null => {
   return data ? { id, type, data } : null
 }
 
-// ── legacySectionsFromAI ──────────────────────────────────────────────────────
-
-export const legacySectionsFromAI = (ai: AiConfig): SectionInstance[] => {
-  const types = Array.isArray(ai.section_order)
-    ? ai.section_order.filter((s) => ["hero", "columns", "overlay"].includes(s))
-    : (["hero", "columns", "overlay"] as SectionType[])
-  const heroUrl = ai.hero_image_url || ""
-  const hero: HeroSectionData = {
-    layout_style: "centered_bg",
-    hero_type: heroUrl ? "image" : ai.hero_type === "text" ? "text" : "image",
-    hero_title: ai.hero_title || "",
-    hero_subtitle: ai.hero_subtitle || "",
-    cta_text: "En savoir plus",
-    hero_text_color: ai.hero_text_color || "#ffffff",
-    hero_font_family: ai.hero_font_family || "sans-serif",
-    hero_font_size: toSize(ai.hero_font_size, "xl"),
-    hero_image_file: null,
-    hero_image_preview_url: heroUrl,
-    hero_image_preview_urls: heroUrl ? [heroUrl] : [],
-  }
-  const cols = emptyColumns()
-  ;(ai.columns || []).forEach((col, i) => {
-    if (i < 4) {
-      const hasImage = Boolean(col.image_url)
-      const rawType = col.content_type as ContentType | undefined
-      cols[i] = {
-        position: col.position ?? i + 1,
-        content_type:
-          hasImage && (!rawType || rawType === "text_only")
-            ? "both"
-            : rawType && ["both", "image_only", "text_only", "slider"].includes(rawType)
-              ? rawType
-              : "both",
-        title: col.title || "",
-        image_file: null,
-        image_preview_url: col.image_url || "",
-        images: hasImage ? [col.image_url as string] : [],
-        text: col.text || "",
-      }
-    }
-  })
-  const columns: ColumnsSectionData = {
-    layout_style: "grid_cards",
-    title: "",
-    subtitle: "",
-    column_count: Math.min(Math.max(Number(ai.column_count) || 3, 1), 4),
-    columns: cols,
-  }
-  const overlayUrl = ai.overlay_image_url || ""
-  const overlay: OverlaySectionData = {
-    layout_style: "full_bg_banner",
-    overlay_title: ai.overlay_title || "",
-    overlay_subtitle: ai.overlay_subtitle || "",
-    cta_text: "Contactez-nous",
-    overlay_font_size: "lg",
-    overlay_text_color: ai.overlay_text_color || "#ffffff",
-    overlay_font_family: ai.overlay_font_family || "sans-serif",
-    overlay_image_file: null,
-    overlay_image_preview_url: overlayUrl,
-    overlay_image_preview_urls: overlayUrl ? [overlayUrl] : [],
-  }
-  const map: Record<string, SectionInstance> = {
-    hero: { id: "hero_1", type: "hero", data: hero },
-    columns: { id: "columns_1", type: "columns", data: columns },
-    overlay: { id: "overlay_1", type: "overlay", data: overlay },
-  }
-  return types.map((t: string) => map[t]).filter(Boolean)
-}
-
 // ── sectionsFromAI ────────────────────────────────────────────────────────────
 
 export const sectionsFromAI = (ai: AiConfig): { sections: SectionInstance[]; theme: ThemeState } => {
@@ -286,7 +217,7 @@ export const sectionsFromAI = (ai: AiConfig): { sections: SectionInstance[]; the
   const sections =
     Array.isArray(ai.sections) && ai.sections.length > 0
       ? (ai.sections.map(normalizeAiSection).filter(Boolean) as SectionInstance[])
-      : legacySectionsFromAI(ai)
+      : defaultConfigState.sections
   return { sections: sections.length ? sections : defaultConfigState.sections, theme }
 }
 

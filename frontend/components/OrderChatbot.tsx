@@ -69,7 +69,7 @@ export default function OrderChatbot({
   const handleOrder = useCallback(
     async (details: ChatOrderDetails) => {
       const product = catalog.flatMap((cat) => cat.products).find((p) => p.name === details.product_name)
-      if (!product || typeof product.id !== "number") {
+      if (!product) {
         pushMessage({
           sender: "bot",
           text: "Je n'ai pas pu identifier ce produit dans la boutique pour créer la commande.",
@@ -100,7 +100,8 @@ export default function OrderChatbot({
             address: details.address || "",
             items: [
               {
-                product_id: product.id,
+                ...(typeof product.id === "number" ? { product_id: product.id } : {}),
+                product_name: details.product_name,
                 quantity:
                   typeof details.quantity === "number" && details.quantity >= 1
                     ? details.quantity

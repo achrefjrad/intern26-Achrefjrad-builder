@@ -5,46 +5,10 @@ from django.core.files.storage import default_storage
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from .models import WebsiteConfig, Column, BackgroundOverlay, Section, Project, Category, Product, Order, OrderLine
+from .models import Project, Category, Product, Order, OrderLine
 from .ai_service import generate_config, handle_chat_message
 
-VALID_SECTION_TYPES = {'hero', 'columns', 'gallery', 'testimonials', 'stats', 'overlay', 'navbar', 'footer'}
 DEFAULT_DRAFT_PROJECT_NAME = "__draft__"
-
-
-def _normalize_section_order(section_order):
-    """Accepte des objets {id, type} ou des chaînes simples ('hero', 'columns', 'overlay')."""
-    if not isinstance(section_order, list):
-        return None
-    items = []
-    for item in section_order:
-        if isinstance(item, dict) and item.get('id') and item.get('type') in VALID_SECTION_TYPES:
-            items.append({'id': str(item['id']), 'type': item['type']})
-        elif isinstance(item, str) and item in VALID_SECTION_TYPES:
-            items.append({'id': f'{item}_1', 'type': item})
-        else:
-            return None
-    return items
-
-
-def save_sections(config, sections):
-    """Persiste une liste de sections [{id, type, data}] et met à jour section_order."""
-    order = []
-    for item in sections:
-        if not isinstance(item, dict):
-            continue
-        section_type = item.get('type')
-        data = item.get('data')
-        if section_type not in VALID_SECTION_TYPES or not isinstance(data, dict):
-            continue
-        sid = str(item.get('id') or '')
-        if not sid:
-            sid = f'{section_type}_{len(order) + 1}'
-        Section.objects.update_or_create(id=sid, defaults={'section_type': section_type, 'data': data})
-        order.append({'id': sid, 'type': section_type})
-    if order:
-        config.section_order = order
-        config.save(update_fields=['section_order'])
 
 
 class GenerateView(APIView):
@@ -57,20 +21,12 @@ class GenerateView(APIView):
             )
         config = generate_config(prompt)
 
-        # Update the modern draft Project
         draft_project, _ = Project.objects.get_or_create(
             name=DEFAULT_DRAFT_PROJECT_NAME,
             defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
         )
         draft_project.original_prompt = prompt
         draft_project.save(update_fields=['original_prompt'])
-
-        # Transitional legacy mirror (until Stage 2 model removal)
-        try:
-            WebsiteConfig.objects.get_or_create(id=1)
-            WebsiteConfig.objects.filter(id=1).update(original_prompt=prompt)
-        except Exception:
-            pass
 
         return Response({**config, 'original_prompt': prompt}, status=status.HTTP_200_OK)
 
@@ -97,63 +53,6 @@ class ChatView(APIView):
         return Response(result, status=status.HTTP_200_OK)
 
 
-def build_legacy_view(project_or_config, sections):
-    """Construit les champs hérités (hero_banner, columns, overlay) depuis les sections."""
-    if not project_or_config:
-        return {'hero_banner': None, 'columns': [], 'overlay': None}
-
-    def first_data(section_type):
-        for sec in sections:
-            if isinstance(sec, dict) and sec.get('type') == section_type:
-                return sec.get('data') or {}
-        return {}
-
-    hero = first_data('hero')
-    cols = first_data('columns')
-    overlay = first_data('overlay')
-
-    columns_data = []
-    for col in cols.get('columns') or []:
-        if isinstance(col, dict):
-            columns_data.append({
-                'id': col.get('position'),
-                'position': col.get('position'),
-                'content_type': col.get('content_type', 'both'),
-                'image': col.get('image') or '',
-                'images': col.get('images') or [],
-                'text': col.get('text') or '',
-            })
-
-    prompt = getattr(project_or_config, 'original_prompt', '') or ''
-    project_id = getattr(project_or_config, 'id', 1)
-
-    hero_banner = {
-        'id': project_id,
-        'hero_type': hero.get('hero_type', 'image'),
-        'hero_images': hero.get('hero_images') or [],
-        'hero_title': hero.get('hero_title', ''),
-        'hero_subtitle': hero.get('hero_subtitle', ''),
-        'hero_text_color': hero.get('hero_text_color', '#ffffff'),
-        'hero_font_family': hero.get('hero_font_family', 'sans-serif'),
-        'hero_font_size': hero.get('hero_font_size', 'xl'),
-        'column_count': cols.get('column_count', 4),
-        'hero_first': True,
-        'section_order': [{'id': s['id'], 'type': s['type']} for s in sections if isinstance(s, dict) and 'id' in s and 'type' in s],
-        'original_prompt': prompt,
-        'overlay': {
-            'id': project_id,
-            'bg_image': (overlay.get('images') or [''])[0],
-            'overlay_images': overlay.get('images') or [],
-            'title': overlay.get('title', ''),
-            'subtitle': overlay.get('subtitle', ''),
-            'font_size': overlay.get('font_size', 'lg'),
-            'text_color': overlay.get('text_color', '#ffffff'),
-            'font_family': overlay.get('font_family', 'sans-serif'),
-        },
-    }
-    return {'hero_banner': hero_banner, 'columns': columns_data, 'overlay': hero_banner['overlay']}
-
-
 class ConfigView(APIView):
     def get(self, request):
         project, _ = Project.objects.get_or_create(
@@ -161,7 +60,6 @@ class ConfigView(APIView):
             defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
         )
         sections = project.sections if isinstance(project.sections, list) else []
-        legacy = build_legacy_view(project, sections)
         return Response({
             'id': project.id,
             'name': project.name,
@@ -176,7 +74,6 @@ class ConfigView(APIView):
                 }
                 for cat in project.categories.all()
             ],
-            **legacy,
         })
 
     def post(self, request):
@@ -246,18 +143,6 @@ class ConfigView(APIView):
                             )
 
         project.save()
-
-        # Transitional legacy mirror (until Stage 2 model removal)
-        try:
-            config, _ = WebsiteConfig.objects.get_or_create(id=1)
-            if isinstance(project.sections, list) and project.sections:
-                save_sections(config, project.sections)
-            if project.original_prompt:
-                config.original_prompt = project.original_prompt
-                config.save(update_fields=['original_prompt'])
-        except Exception:
-            pass
-
         return self.get(request)
 
 
@@ -464,31 +349,61 @@ class OrderView(APIView):
             if not isinstance(item, dict):
                 continue
             product_id = item.get('product_id')
+            product_name = item.get('product_name')
             try:
                 product_id = int(product_id)
             except (ValueError, TypeError):
-                continue
+                product_id = None
             try:
                 quantity = int(item.get('quantity', 1) or 1)
             except (ValueError, TypeError):
                 quantity = 1
             if quantity < 1:
                 quantity = 1
-            parsed_items.append({'product_id': product_id, 'quantity': quantity})
+            parsed_items.append({
+                'product_id': product_id,
+                'product_name': str(product_name or '').strip() or None,
+                'quantity': quantity,
+            })
         if not parsed_items:
             return Response({'error': 'No valid items provided'}, status=status.HTTP_400_BAD_REQUEST)
 
-        product_ids = [i['product_id'] for i in parsed_items]
+        product_ids = [i['product_id'] for i in parsed_items if i['product_id'] is not None]
         products = Product.objects.select_related('category__project').filter(id__in=product_ids)
         product_map = {p.id: p for p in products}
 
         for item in parsed_items:
-            product = product_map.get(item['product_id'])
-            if product is None:
-                return Response(
-                    {'error': f"Product {item['product_id']} not found in project '{project_name}'"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+            if item['product_id'] is not None:
+                product = product_map.get(item['product_id'])
+                if product is None:
+                    return Response(
+                        {'error': f"Product {item['product_id']} not found in project '{project_name}'"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+            else:
+                name = item.get('product_name')
+                if not name:
+                    return Response(
+                        {'error': 'Each item must provide a product_id or a product_name'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                matches = list(Product.objects.select_related('category__project').filter(
+                    category__project_id=project.id,
+                    name=name,
+                ))
+                if not matches:
+                    return Response(
+                        {'error': f"Product '{name}' not found in project '{project_name}'"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                if len(matches) > 1:
+                    return Response(
+                        {'error': f"Product name '{name}' is ambiguous in project '{project_name}'"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                product = matches[0]
+                item['product_id'] = product.id
+                product_map[product.id] = product
             if product.category.project_id != project.id:
                 return Response(
                     {'error': f"Product {product.name} does not belong to project '{project_name}'"},

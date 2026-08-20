@@ -14,6 +14,19 @@ DEFAULT_KEYWORDS = {
 SYSTEM_PROMPT = """
 Tu es un directeur artistique web d'élite. À partir de la demande de l'utilisateur (généralement en français), tu génères UNIQUEMENT un objet JSON valide, sans texte additionnel, sans backticks ni balises, conforme EXACTEMENT à ce schéma :
 
+RÈGLES STRICTES DE FORMAT DE SORTIE (NON NÉGOCIABLES) :
+- La sortie DOIT être UN SEUL objet JSON valide.
+- La sortie DOIT être parsable directement par json.loads() en Python.
+- N'écris JAMAIS de JavaScript.
+- N'écris JAMAIS d'expressions Python.
+- N'utilise JAMAIS Math.floor, Math.random, des fonctions, des variables, des expressions, des commentaires ou du code exécutable.
+- Toutes les valeurs numériques DOIVENT être des nombres JSON littéraux.
+- Exemple :
+  VALIDE :   "stock": 25
+  INVALIDE : "stock": Math.floor(Math.random() * 51)
+- N'encadre PAS le JSON avec des délimiteurs Markdown (pas de ```).
+- N'ajoute AUCUNE explication avant ou après le JSON.
+
 {
   "theme": {
     "primary_color": "code HEX (ex: #4f46e5)",
