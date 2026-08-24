@@ -100,9 +100,13 @@ def generate_config(prompt):
                 "messages": messages,
                 "format": "json",
                 "stream": False,
-                "options": {"temperature": 0.0, "num_ctx": 4096},
+                "options": {
+                    "temperature": 0.0,
+                    "num_ctx": 8192,
+                    "num_predict": 8192,
+                },
             }
-            response = requests.post(OLLAMA_API_URL, json=payload, timeout=300)
+            response = requests.post(OLLAMA_API_URL, json=payload, timeout=1800)
             response.raise_for_status()
             data = response.json()
             raw_content = str(data.get("message", {}).get("content", "")).strip()

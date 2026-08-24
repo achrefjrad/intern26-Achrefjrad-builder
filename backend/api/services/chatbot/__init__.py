@@ -1,5 +1,5 @@
 # Chatbot subpackage
-from .handler import handle_chat_message
+from .handler import handle_chat_message, build_reply_context, build_reply_action, reply_requires_catalog
 from .order_state import (
     ORDER_FLOW_FIELDS,
     normalize_order_state,
@@ -30,6 +30,9 @@ from .catalog_matcher import (
 
 __all__ = [
     "handle_chat_message",
+    "build_reply_context",
+    "build_reply_action",
+    "reply_requires_catalog",
     "ORDER_FLOW_FIELDS",
     "normalize_order_state",
     "apply_order_message",

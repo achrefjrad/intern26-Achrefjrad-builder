@@ -1,6 +1,8 @@
 import json
+import re
 from unittest.mock import patch
 
+import requests
 from django.test import TestCase
 
 from .ai_service import (
@@ -9,8 +11,22 @@ from .ai_service import (
     get_next_missing_field,
     build_order_details,
     handle_chat_message,
+    build_reply_action,
+    reply_requires_catalog,
 )
 from .models import Order, OrderLine, Project, Category, Product
+from api.prompts import CHATBOT_SYSTEM_PROMPT
+from api.services.chatbot.intent import INTENT_SYSTEM_PROMPT, detect_intent, _parse_intent_response
+from api.services.chatbot.language import (
+    LANGUAGE_SYSTEM_PROMPT,
+    DEFAULT_LANGUAGE,
+    detect_language,
+    _parse_language_response,
+    is_data_only_message,
+    is_language_bearing_message,
+    pick_language_source_message,
+)
+from api.services.chatbot.handler import build_reply_style_examples, _REPLY_STYLE_EXAMPLES, _CATALOG_AUTHORITY
 from api.services.llm.huggingface import call_huggingface
 from api.services.site_generation import generate_config
 
@@ -23,6 +39,36 @@ CATALOG = [
         ],
     }
 ]
+
+
+def _language_result(**overrides):
+    base = {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}
+    base.update(overrides)
+    return json.dumps(base)
+
+
+def _chat_llm_factory(*, intent=None, language=None, reply=None, default_product="Champignons"):
+    """Mock du LLM qui répond selon le type de prompt (intention / langue / reply)."""
+    def factory(messages, **_kwargs):
+        system = messages[0]["content"]
+        if system == INTENT_SYSTEM_PROMPT:
+            if intent is not None:
+                return intent
+            return json.dumps({"intent": "start_order", "product_name": default_product, "quantity": 1})
+        if "détecteur de langue" in system:
+            return language if language is not None else _language_result()
+        return reply if reply is not None else json.dumps(
+            {"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False
+        )
+    return factory
+
+
+def _reply_call(calls):
+    """Retourne l'appel de génération de réponse (prompt 'assistant de vente virtuel')."""
+    for messages in calls:
+        if "assistant de vente virtuel" in messages[0]["content"]:
+            return messages
+    return None
 
 
 class OrderStateMachineTests(TestCase):
@@ -143,6 +189,971 @@ class HandleChatMessageDeterministicTests(TestCase):
         )
         self.assertIs(result["order_ready"], True)
         self.assertEqual(result["order_details"].get("email"), "ade@exemple.com")
+
+
+class IntentParseTests(TestCase):
+    def test_valid_intent(self):
+        result = _parse_intent_response(
+            '{"intent": "start_order", "product_name": "Toyota Corolla", "quantity": 2}'
+        )
+        self.assertEqual(result["intent"], "start_order")
+        self.assertEqual(result["product_name"], "Toyota Corolla")
+        self.assertEqual(result["quantity"], 2)
+
+    def test_invalid_json_falls_back_to_other(self):
+        result = _parse_intent_response("ceci n'est pas du json")
+        self.assertEqual(result["intent"], "other")
+        self.assertEqual(result["product_name"], "")
+        self.assertIsNone(result["quantity"])
+
+    def test_unknown_intent_falls_back_to_other(self):
+        result = _parse_intent_response('{"intent": "flying_car", "product_name": "x"}')
+        self.assertEqual(result["intent"], "other")
+
+    def test_bad_quantity_ignored(self):
+        result = _parse_intent_response('{"intent": "start_order", "quantity": "abc"}')
+        self.assertIsNone(result["quantity"])
+
+    def test_zero_quantity_ignored(self):
+        result = _parse_intent_response('{"intent": "start_order", "quantity": 0}')
+        self.assertIsNone(result["quantity"])
+
+    def test_fenced_json_accepted(self):
+        result = _parse_intent_response(
+            '```json\n{"intent": "greeting", "product_name": "", "quantity": null}\n```'
+        )
+        self.assertEqual(result["intent"], "greeting")
+
+    def test_dict_input_accepted(self):
+        result = _parse_intent_response(
+            {"intent": "cancel_order", "product_name": "", "quantity": None}
+        )
+        self.assertEqual(result["intent"], "cancel_order")
+
+
+class MultilingualIntentTests(TestCase):
+    # Messages de test : français, arabe (MSA), darija tunisien, arabizi et mélange.
+    # Aucune phrase n'est codée en dur dans la logique : elles servent uniquement
+    # à vérifier que le message brut est transmis au LLM et que le routage fonctionne.
+    SAMPLES = [
+        ("je voudrais passer une commande", "start_order"),
+        ("نحب نعدي كوموند", "start_order"),
+        ("قلبنا نشتري طماطم", "start_order"),
+        ("n7eb n3adi commande", "start_order"),
+        ("n7eb nechri Toyota Corolla", "start_order"),
+        ("bonsoir", "greeting"),
+        ("chkoun ya3ref wino l fromage", "product_search"),
+        ("wesh alay l prix mte3 l tomates", "product_inquiry"),
+    ]
+
+    def test_detect_intent_uses_multilingual_prompt_and_raw_message(self):
+        with patch("api.services.chatbot.handler._call_chatbot_llm") as mock_llm:
+            mock_llm.return_value = '{"intent": "start_order", "product_name": "", "quantity": null}'
+            for raw_message, _intent in self.SAMPLES:
+                detect_intent(raw_message, mock_llm)
+        calls = [call.args[0] for call in mock_llm.call_args_list]
+        sent_messages = {messages[-1]["content"] for messages in calls}
+        self.assertEqual(sent_messages, {msg for msg, _ in self.SAMPLES})
+        for messages in calls:
+            self.assertEqual(messages[0]["content"], INTENT_SYSTEM_PROMPT)
+
+    def test_handle_chat_message_start_order_routing(self):
+        intent_json = json.dumps(
+            {"intent": "start_order", "product_name": "Toyota Corolla", "quantity": 2}
+        )
+        reply_json = json.dumps(
+            {
+                "reply": "Tayeb ! Shno ismek el kamel, 3aychek ?",
+                "order_ready": False,
+                "order_details": {},
+            },
+            ensure_ascii=False,
+        )
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=intent_json,
+            reply=reply_json,
+        )):
+            result = handle_chat_message("proj", CATALOG, [], "n7eb nechri Toyota Corolla", {})
+        self.assertEqual(result["order_details"]["product_name"], "Toyota Corolla")
+        self.assertEqual(result["order_details"]["quantity"], 2)
+        self.assertIs(result["order_ready"], False)
+        self.assertNotEqual(result["reply"], "")
+
+    def test_start_order_without_product_keeps_flow_open(self):
+        intent_json = json.dumps(
+            {"intent": "start_order", "product_name": "", "quantity": None}
+        )
+        reply_json = json.dumps(
+            {
+                "reply": "Bien sûr ! Quel produit souhaitez-vous commander ?",
+                "order_ready": False,
+                "order_details": {},
+            },
+            ensure_ascii=False,
+        )
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=intent_json,
+            reply=reply_json,
+        )):
+            result = handle_chat_message("proj", CATALOG, [], "نحب نعدي كوموند", {})
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+        self.assertIs(result["order_ready"], False)
+
+    def test_non_start_order_does_not_touch_state(self):
+        intent_json = json.dumps(
+            {"intent": "greeting", "product_name": "", "quantity": None}
+        )
+        reply_json = json.dumps(
+            {"reply": "Bonjour !", "order_ready": False, "order_details": {}},
+            ensure_ascii=False,
+        )
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=intent_json,
+            reply=reply_json,
+        )):
+            result = handle_chat_message("proj", CATALOG, [], "bonsoir", {})
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+        self.assertEqual(result["order_details"].get("name", ""), "")
+
+    def test_no_intent_call_mid_flow(self):
+        reply_json = json.dumps(
+            {
+                "reply": "Merci ! Quel est votre numéro de téléphone ?",
+                "order_ready": False,
+                "order_details": {},
+            },
+            ensure_ascii=False,
+        )
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            if "détecteur de langue" in messages[0]["content"]:
+                return _language_result(is_language_question=False)
+            return reply_json
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", CATALOG, [], "Ali", {"product_name": "Champignons"})
+        # En plein flux : une seule détection de langue + le reply. Jamais d'intention.
+        self.assertEqual(len(calls), 2)
+        self.assertNotIn(INTENT_SYSTEM_PROMPT, [m[0]["content"] for m in calls])
+        self.assertEqual(calls[-1][-1]["content"], "Ali")
+
+    def test_intent_call_failure_does_not_crash(self):
+        with patch("api.services.chatbot.handler._call_chatbot_llm") as mock_llm:
+            mock_llm.side_effect = requests.exceptions.Timeout("boom")
+            result = handle_chat_message("proj", CATALOG, [], "je veux commander", {})
+        self.assertIn("reply", result)
+        self.assertIs(result["order_ready"], False)
+
+    def test_malformed_intent_json_falls_back_to_other(self):
+        with patch("api.services.chatbot.handler._call_chatbot_llm") as mock_llm:
+            mock_llm.side_effect = ["pas du json", "{}", "{}"]
+            result = handle_chat_message("proj", CATALOG, [], "bonsoir", {})
+        self.assertIs(result["order_ready"], False)
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+
+
+class StartOrderMessageNotStoredAsNameTests(TestCase):
+    # BUG 1 : un message multilingue qui démarre une commande ne doit JAMAIS être
+    # interprété comme le nom du client par la logique déterministe de saisie.
+    CATALOG = [
+        {"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]},
+        {"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 10}]},
+        {"name": "Voitures", "products": [{"name": "BMW 5 Series", "price": "20000 €", "stock": 1}]},
+    ]
+
+    def _start(self, message, product, catalog):
+        intent_json = json.dumps(
+            {"intent": "start_order", "product_name": product, "quantity": 1}
+        )
+        reply_json = json.dumps(
+            {"reply": "Bien sûr ! Quel est votre nom complet ?", "order_ready": False, "order_details": {}},
+            ensure_ascii=False,
+        )
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=intent_json,
+            reply=reply_json,
+        )):
+            return handle_chat_message("proj", catalog, [], message, {})
+
+    def test_arabic_order_message_not_stored_as_name(self):
+        result = self._start("أريد تقديم طلب nissan altima", "nissan altima", self.CATALOG)
+        self.assertEqual(result["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(result["order_ready"], False)
+        name = result["order_details"].get("name", "")
+        self.assertNotIn("أريد", name)
+        self.assertNotIn("تقديم", name)
+
+    def test_tunisian_darija_order_message_not_stored_as_name(self):
+        result = self._start("نحب نعدي كوموند Espresso", "Espresso", self.CATALOG)
+        self.assertEqual(result["order_details"].get("product_name"), "Espresso")
+        self.assertIs(result["order_ready"], False)
+        self.assertNotIn("نحب", result["order_details"].get("name", ""))
+
+    def test_arabizi_order_message_not_stored_as_name(self):
+        result = self._start("n7eb n3adi commande BMW 5 Series", "BMW 5 Series", self.CATALOG)
+        self.assertEqual(result["order_details"].get("product_name"), "BMW 5 Series")
+        self.assertIs(result["order_ready"], False)
+        self.assertNotIn("n7eb", result["order_details"].get("name", ""))
+
+    def test_french_order_message_not_stored_as_name(self):
+        result = self._start("je voudrais commander des champignons", "Champignons", CATALOG)
+        self.assertEqual(result["order_details"].get("product_name"), "Champignons")
+        self.assertIs(result["order_ready"], False)
+        self.assertNotIn("champignons", result["order_details"].get("name", "").lower())
+
+
+class OrderPersistenceTransitionTests(TestCase):
+    """BUG 2 : une commande complète ne doit être persistée qu'une seule fois."""
+
+    CHAT_CATALOG = [
+        {"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 10}]}
+    ]
+
+    def setUp(self):
+        self.project = Project.objects.create(name="boutique-test")
+        self.category = Category.objects.create(project=self.project, name="Boissons")
+        self.product = Product.objects.create(
+            category=self.category,
+            name="Espresso",
+            price="2.50 €",
+            stock=10,
+        )
+
+    @staticmethod
+    def _fake_llm(messages, **_kwargs):
+        system = messages[0]["content"]
+        if "détecteur de langue" in system:
+            return json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False})
+        if "classificateur d'intentions" in system:
+            return json.dumps({"intent": "start_order", "product_name": "Espresso", "quantity": 1})
+        return json.dumps(
+            {"reply": "D'accord.", "order_ready": False, "order_details": {}},
+            ensure_ascii=False,
+        )
+
+    def _send(self, text, state):
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=self._fake_llm):
+            result = handle_chat_message("proj", self.CHAT_CATALOG, [], text, state)
+        # Reproduit la fusion du frontend (orderStateRef).
+        for key, value in (result.get("order_details") or {}).items():
+            if key == "quantity":
+                if isinstance(value, int) and value >= 1:
+                    state[key] = value
+            elif isinstance(value, str) and value.strip():
+                state[key] = value
+        return result
+
+    def _create_order_like_frontend(self, details):
+        name = (details.get("name") or "").strip()
+        parts = name.split()
+        if parts:
+            first_name = parts[0]
+            last_name = " ".join(parts[1:]) if len(parts) > 1 else parts[0]
+        else:
+            first_name = last_name = "-"
+        return self.client.post(
+            "/api/orders/",
+            {
+                "project_name": "boutique-test",
+                "first_name": first_name,
+                "last_name": last_name,
+                "email": details.get("email") or "",
+                "phone": details.get("phone") or "",
+                "address": details.get("address") or "",
+                "items": [
+                    {
+                        "product_name": details.get("product_name") or "",
+                        "quantity": details.get("quantity") or 1,
+                    }
+                ],
+            },
+            content_type="application/json",
+        )
+
+    def test_completed_order_creates_exactly_one_db_order(self):
+        state = {}
+        r = self._send("نحب نعدي كوموند Espresso", state)
+        self.assertIs(r["order_ready"], False)
+        r = self._send("Ali", state)
+        self.assertIs(r["order_ready"], False)
+        r = self._send("23456789", state)
+        self.assertIs(r["order_ready"], False)
+        r = self._send("tunis", state)
+        self.assertIs(r["order_ready"], False)
+        r = self._send("email@gmail.com", state)
+        self.assertIs(r["order_ready"], True)
+
+        res = self._create_order_like_frontend(r["order_details"])
+        self.assertEqual(res.status_code, 201)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(OrderLine.objects.count(), 1)
+
+        # Le frontend fixé remet l'état actif à vide après persistance : les
+        # messages suivants ne doivent rien recréer.
+        state = {}
+        r = self._send("شكرا", state)
+        self.assertIs(r["order_ready"], False)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(OrderLine.objects.count(), 1)
+
+        r = self._send("merci", state)
+        self.assertIs(r["order_ready"], False)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(OrderLine.objects.count(), 1)
+
+    def test_stale_complete_state_does_not_retrigger_order(self):
+        # Même sans remise à zéro du frontend (état encore complet), le backend ne
+        # renvoie order_ready=true que sur la transition : "شكرا" ne recrée rien.
+        state = {}
+        self._send("نحب نعدي كوموند Espresso", state)
+        self._send("Ali", state)
+        self._send("23456789", state)
+        self._send("tunis", state)
+        r = self._send("email@gmail.com", state)
+        self.assertIs(r["order_ready"], True)
+        self.assertEqual(self._create_order_like_frontend(r["order_details"]).status_code, 201)
+        self.assertEqual(Order.objects.count(), 1)
+
+        r = self._send("شكرا", state)
+        self.assertIs(r["order_ready"], False)
+        self.assertEqual(Order.objects.count(), 1)
+        self.assertEqual(OrderLine.objects.count(), 1)
+
+
+class LanguageMirroringTests(TestCase):
+    """Le reply LLM doit recevoir le message ACTUEL du client + les instructions de
+    miroir de langue. On teste les propriétés (prompt, passage du message, flux
+    déterministe) plutôt que le texte exact généré par le modèle."""
+
+    def test_system_prompt_instructs_language_mirroring(self):
+        prompt = CHATBOT_SYSTEM_PROMPT
+        self.assertIn("MIROIR DE LANGUE", prompt)
+        self.assertIn("même langue", prompt)
+        self.assertIn("arabizi", prompt)
+        self.assertIn("darija", prompt)
+        self.assertIn("message ACTUEL", prompt)
+        self.assertIn("priorité", prompt)
+        self.assertIn("Ne critique jamais", prompt)
+        self.assertIn("Ne repasse pas au français", prompt)
+
+    def test_system_prompt_has_no_hardcoded_example_phrases(self):
+        prompt = CHATBOT_SYSTEM_PROMPT.lower()
+        for phrase in (
+            "نحب نعدي كوموند",
+            "نحب نكمل الطلب",
+            "n7eb n3adi commande",
+            "أريد تقديم طلب",
+            "bel tab3",
+            "بالطبيعة",
+            "toyota corolla",
+        ):
+            self.assertNotIn(phrase, prompt)
+
+    def test_system_prompt_declares_deterministic_facts_authoritative(self):
+        prompt = CHATBOT_SYSTEM_PROMPT
+        self.assertIn("{reply_context}", prompt)
+        self.assertIn("FAITS AUTORITATIFS", prompt)
+        for token in ("INTENT", "PRODUCT", "QUANTITY", "NEXT_FIELD", "ORDER_STATE"):
+            self.assertIn(token, prompt)
+        self.assertIn("Ne les invente jamais", prompt)
+        self.assertIn("ne prétends jamais qu'un produit indiqué dans PRODUCT est indisponible", prompt)
+
+    def test_system_prompt_uses_dynamic_action_contract(self):
+        prompt = CHATBOT_SYSTEM_PROMPT
+        self.assertIn("{reply_action}", prompt)
+        # Le catalogue est injecté dynamiquement (jamais dans le template) :
+        # pendant le flux de commande, son absence évite les hallucinations
+        # de disponibilité / stock sur le petit modèle reply.
+        self.assertNotIn("{catalog}", prompt)
+        self.assertNotIn("CATALOGUE DES PRODUITS", prompt)
+        self.assertNotIn("TON ET STYLE", prompt)
+        self.assertNotIn("CONSIGNES DE RÉPONSE", prompt)
+
+    def test_system_prompt_has_no_long_french_reply_example(self):
+        prompt = CHATBOT_SYSTEM_PROMPT
+        self.assertNotIn("Excellent choix !", prompt)
+        self.assertNotIn("Pour préparer votre commande", prompt)
+        self.assertNotIn("pourrais-je avoir votre nom", prompt)
+        # Le JSON de sortie reste le contrat exact.
+        self.assertIn('"order_ready": false', prompt)
+        self.assertIn('"name": ""', prompt)
+
+    def test_reply_llm_receives_current_message_and_mirroring_prompt(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1})
+            if "détecteur de langue" in system:
+                return _language_result(is_language_question=False)
+            return json.dumps(
+                {"reply": "بالتأكيد! ما اسمك الكامل؟", "order_ready": False, "order_details": {}},
+                ensure_ascii=False,
+            )
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message(
+                "proj",
+                [{"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]}],
+                [
+                    {"sender": "user", "text": "Bonjour, je veux passer une commande."},
+                    {"sender": "bot", "text": "Bien sûr ! Quel produit souhaitez-vous commander ?"},
+                ],
+                "أريد تقديم طلب Nissan Altima",
+                {},
+            )
+
+        reply_call = _reply_call(calls)
+        self.assertIsNotNone(reply_call)
+        self.assertEqual(reply_call[-1]["content"], "أريد تقديم طلب Nissan Altima")
+        system = reply_call[0]["content"]
+        self.assertIn("même langue", system)
+        self.assertIn("arabizi", system)
+        self.assertIn("darija", system)
+        self.assertIn("message ACTUEL", system)
+        self.assertIn("Language: Arabic", system)
+        self.assertIn("Style: Modern Standard Arabic", system)
+
+        # Le modèle voit aussi le message français précédent (le changement de
+        # langue), mais la règle lui donne priorité au message actuel.
+        history_texts = [m["content"] for m in reply_call[1:-1] if m["role"] == "user"]
+        self.assertIn("Bonjour, je veux passer une commande.", history_texts)
+
+        # Le flux déterministe n'est pas altéré.
+        self.assertEqual(result["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(result["order_ready"], False)
+        self.assertFalse(result["order_details"].get("name"))
+        self.assertEqual(result["reply"], "بالتأكيد! ما اسمك الكامل؟")
+
+    def test_current_message_prioritized_across_scripts(self):
+        history = [
+            {"sender": "user", "text": "Bonjour, je veux passer une commande."},
+            {"sender": "bot", "text": "Bien sûr ! Quel produit souhaitez-vous commander ?"},
+        ]
+        for current in (
+            "أريد تقديم طلب Nissan Altima",
+            "نحب نعدي كوموند Espresso",
+            "n7eb n3adi commande BMW 5 Series",
+        ):
+            calls = []
+
+            def recorder(messages, **_kwargs):
+                calls.append(messages)
+                system = messages[0]["content"]
+                if system == INTENT_SYSTEM_PROMPT:
+                    return json.dumps({"intent": "start_order", "product_name": "x", "quantity": 1})
+                if "détecteur de langue" in system:
+                    return _language_result(is_language_question=False)
+                return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+            with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+                handle_chat_message("proj", CATALOG, history, current, {})
+            reply_call = _reply_call(calls)
+            self.assertIsNotNone(reply_call)
+            self.assertEqual(reply_call[-1]["content"], current)
+
+    def test_arabic_reply_passed_through_unchanged(self):
+        arabic_reply = "بالتأكيد! ما اسمك الكامل؟"
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1}),
+            language=_language_result(),
+            reply=json.dumps({"reply": arabic_reply, "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )):
+            result = handle_chat_message(
+                "proj",
+                [{"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]}],
+                [],
+                "أريد تقديم طلب Nissan Altima",
+                {},
+            )
+        self.assertEqual(result["reply"], arabic_reply)
+        self.assertEqual(result["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(result["order_ready"], False)
+        self.assertFalse(result["order_details"].get("name"))
+
+
+class LanguageDetectionTests(TestCase):
+    """Couche de détection langue/style : le reply LLM reçoit le message ACTUEL +
+    un bloc de métadonnées Language / Script / Style, et une question sur la langue
+    ne perturbe jamais l'état déterministe de la commande."""
+
+    CATALOG = [
+        {"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]},
+        {"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 10}]},
+        {"name": "Voitures", "products": [{"name": "BMW 5 Series", "price": "20000 €", "stock": 1}]},
+    ]
+
+    def test_parse_valid_language_output(self):
+        result = _parse_language_response(
+            '{"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": true}'
+        )
+        self.assertEqual(result["language"], "ar")
+        self.assertEqual(result["script"], "arabic")
+        self.assertEqual(result["style"], "tunisian_darija")
+        self.assertTrue(result["is_language_question"])
+
+    def test_parse_invalid_language_output_falls_back(self):
+        result = _parse_language_response("pas du json")
+        self.assertEqual(result, DEFAULT_LANGUAGE)
+
+    def test_parse_unknown_values_fall_back(self):
+        result = _parse_language_response('{"language": "klingon", "script": "runes", "style": "weird"}')
+        self.assertEqual(result["language"], "mixed")
+        self.assertEqual(result["script"], "mixed")
+        self.assertEqual(result["style"], "mixed")
+        self.assertFalse(result["is_language_question"])
+
+    def test_detect_language_uses_raw_message_and_language_prompt(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            return _language_result()
+
+        result = detect_language("أريد تقديم طلب", recorder)
+        self.assertEqual(result["language"], "ar")
+        self.assertEqual(calls[0][0]["content"], LANGUAGE_SYSTEM_PROMPT)
+        self.assertEqual(calls[0][-1]["content"], "أريد تقديم طلب")
+
+    def test_detect_language_timeout_falls_back(self):
+        def boom(messages, **kwargs):
+            raise requests.exceptions.Timeout("boom")
+
+        result = detect_language("bonjour", boom)
+        self.assertEqual(result, DEFAULT_LANGUAGE)
+
+    def test_detect_language_never_translates(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            return _language_result(language="fr", script="latin", style="french")
+
+        detect_language("je veux commander", recorder)
+        self.assertEqual(calls[0][-1]["content"], "je veux commander")
+
+    def _run_and_capture(self, user_message, order_state, history, language_json, intent_json, reply_json, catalog=None):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return intent_json
+            if "détecteur de langue" in system:
+                return language_json
+            return reply_json
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message("proj", catalog or self.CATALOG, history, user_message, order_state)
+        return result, calls
+
+    def test_arabic_reply_context_has_arabic_metadata(self):
+        r, calls = self._run_and_capture(
+            "أريد تقديم طلب Nissan Altima", {},
+            [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1}),
+            json.dumps({"reply": "بالتأكيد! ما اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        rc = _reply_call(calls)
+        self.assertIsNotNone(rc)
+        self.assertIn("Language: Arabic", rc[0]["content"])
+        self.assertIn("Script: Arabic", rc[0]["content"])
+        self.assertIn("Style: Modern Standard Arabic", rc[0]["content"])
+        self.assertEqual(r["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(r["order_ready"], False)
+        self.assertFalse(r["order_details"].get("name"))
+
+    def test_darija_reply_context_has_darija_metadata(self):
+        r, calls = self._run_and_capture(
+            "نحب نعدي كوموند Espresso", {},
+            [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Espresso", "quantity": 1}),
+            json.dumps({"reply": "بالطبيعة! شنوّة المنتج اللي تحب تطلبو؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        rc = _reply_call(calls)
+        self.assertIsNotNone(rc)
+        self.assertIn("Language: Arabic", rc[0]["content"])
+        self.assertIn("Style: Tunisian Darija", rc[0]["content"])
+        self.assertEqual(r["order_details"].get("product_name"), "Espresso")
+        self.assertIs(r["order_ready"], False)
+
+    def test_arabizi_reply_context_has_arabizi_metadata(self):
+        r, calls = self._run_and_capture(
+            "n7eb n3adi commande BMW 5 Series", {},
+            [],
+            json.dumps({"language": "ar", "script": "latin", "style": "arabizi", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "BMW 5 Series", "quantity": 1}),
+            json.dumps({"reply": "Bel tab3! Chnowa t7eb tcommandi?", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        rc = _reply_call(calls)
+        self.assertIsNotNone(rc)
+        self.assertIn("Language: Arabic", rc[0]["content"])
+        self.assertIn("Script: Latin", rc[0]["content"])
+        self.assertIn("Style: Tunisian Arabizi", rc[0]["content"])
+        self.assertEqual(r["order_details"].get("product_name"), "BMW 5 Series")
+        self.assertIs(r["order_ready"], False)
+
+    def _merge_like_frontend(self, result, state):
+        for key, value in (result.get("order_details") or {}).items():
+            if key == "quantity":
+                if isinstance(value, int) and value >= 1:
+                    state[key] = value
+            elif isinstance(value, str) and value.strip():
+                state[key] = value
+
+    def test_language_question_preserves_order_state(self):
+        state = {}
+        r1, _ = self._run_and_capture(
+            "أريد تقديم طلب Nissan Altima", state, [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1}),
+            json.dumps({"reply": "بالتأكيد! ما اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self._merge_like_frontend(r1, state)
+        self.assertEqual(state.get("product_name"), "Nissan Altima")
+        self.assertIsNone(state.get("name"))
+
+        # Question de langue pendant la commande : état conservé, réponse en arabe.
+        r2, calls = self._run_and_capture(
+            "هل يمكنك التحدث باللغة العربية؟", state, [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": True}),
+            json.dumps({"intent": "other", "product_name": "", "quantity": None}),
+            json.dumps({"reply": "نعم، بالتأكيد. ما اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(state.get("product_name"), "Nissan Altima")
+        self.assertIsNone(state.get("name"))
+        self.assertIs(r2["order_ready"], False)
+        rc = _reply_call(calls)
+        self.assertIsNotNone(rc)
+        self.assertIn("Language: Arabic", rc[0]["content"])
+
+        # Le nom suivant est bien enregistré et le flux continue.
+        r3, _ = self._run_and_capture(
+            "أمين", state, [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}),
+            json.dumps({"intent": "other", "product_name": "", "quantity": None}),
+            json.dumps({"reply": "شكراً، ما هو رقم هاتفك؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self._merge_like_frontend(r3, state)
+        self.assertEqual(state.get("name"), "أمين")
+        self.assertIs(r3["order_ready"], False)
+
+    def test_language_question_in_french_preserves_order_state(self):
+        state = {}
+        r1, _ = self._run_and_capture(
+            "je veux commander des champignons", state, [],
+            json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Champignons", "quantity": 1}),
+            json.dumps({"reply": "Bien sûr ! Quel est votre nom ?", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self._merge_like_frontend(r1, state)
+        self.assertEqual(state.get("product_name"), "Champignons")
+
+        r2, calls = self._run_and_capture(
+            "Tu peux parler français ?", state, [],
+            json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": True}),
+            json.dumps({"intent": "other", "product_name": "", "quantity": None}),
+            json.dumps({"reply": "Bien sûr ! Quel est votre nom ?", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(state.get("product_name"), "Champignons")
+        self.assertIsNone(state.get("name"))
+        self.assertIs(r2["order_ready"], False)
+        rc = _reply_call(calls)
+        self.assertIsNotNone(rc)
+        self.assertIn("Language: French", rc[0]["content"])
+        self.assertIn("Style: French", rc[0]["content"])
+
+    def test_mixed_message_does_not_crash(self):
+        r, _ = self._run_and_capture(
+            "نحب commander BMW", {},
+            [],
+            json.dumps({"language": "mixed", "script": "mixed", "style": "mixed", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "BMW", "quantity": 1}),
+            json.dumps({"reply": "Bel tab3!", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertIs(r["order_ready"], False)
+        self.assertEqual(r["order_details"].get("product_name"), "BMW 5 Series")
+
+    def test_malformed_detector_output_uses_fallback(self):
+        r, _ = self._run_and_capture(
+            "أريد تقديم طلب Nissan Altima", {},
+            [],
+            "pas du json",
+            json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1}),
+            json.dumps({"reply": "بالتأكيد! ما اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertIs(r["order_ready"], False)
+        self.assertEqual(r["order_details"].get("product_name"), "Nissan Altima")
+
+    def test_detector_timeout_uses_fallback(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if "détecteur de langue" in system:
+                raise requests.exceptions.Timeout("boom")
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message("proj", self.CATALOG, [], "أريد تقديم طلب Nissan Altima", {})
+        self.assertIs(result["order_ready"], False)
+        self.assertEqual(result["order_details"].get("product_name"), "Nissan Altima")
+
+
+class ReplyContextTests(TestCase):
+    """Phase 1 : le reply LLM reçoit un bloc de faits déterministes compacts
+    (INTENT, RESPONSE_LANGUAGE, RESPONSE_SCRIPT, PRODUCT, QUANTITY, NEXT_FIELD,
+    ORDER_STATE, CURRENT_USER_MESSAGE) au lieu de devoir redéduire lui-même
+    l'intention, le produit ou la prochaine information demandée."""
+
+    CATALOG = [
+        {"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]},
+        {"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 10}]},
+    ]
+
+    def _run(self, user_message, order_state, history, language_json, intent_json, reply_json, catalog=None):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return intent_json
+            if "détecteur de langue" in system:
+                return language_json
+            return reply_json
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message("proj", catalog or self.CATALOG, history, user_message, order_state)
+        return result, calls
+
+    def _reply_system(self, calls):
+        reply_call = _reply_call(calls)
+        self.assertIsNotNone(reply_call)
+        return reply_call[0]["content"]
+
+    def test_arabic_reply_context(self):
+        r, calls = self._run(
+            "أريد تقديم طلب nissan altima", {}, [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": None}),
+            json.dumps({"reply": "بالتأكيد! ما اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        system = self._reply_system(calls)
+        self.assertIn("INTENT: start_order", system)
+        self.assertIn("PRODUCT: Nissan Altima", system)
+        self.assertIn("NEXT_FIELD: name", system)
+        self.assertIn("RESPONSE_LANGUAGE: Arabic", system)
+        self.assertIn("RESPONSE_SCRIPT: Arabic", system)
+        self.assertIn("CURRENT_USER_MESSAGE: أريد تقديم طلب nissan altima", system)
+        self.assertEqual(r["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(r["order_ready"], False)
+
+    def test_french_reply_context(self):
+        r, calls = self._run(
+            "je veux commander une Nissan Altima", {}, [],
+            json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": None}),
+            json.dumps({"reply": "Bien sûr ! Quel est votre nom complet ?", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        system = self._reply_system(calls)
+        self.assertIn("INTENT: start_order", system)
+        self.assertIn("PRODUCT: Nissan Altima", system)
+        self.assertIn("NEXT_FIELD: name", system)
+        self.assertIn("RESPONSE_LANGUAGE: French", system)
+        self.assertIn("RESPONSE_SCRIPT: Latin", system)
+        self.assertEqual(r["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(r["order_ready"], False)
+
+    def test_darija_detector_result_passed_through(self):
+        _, calls = self._run(
+            "نحب نعدي كوموند BMW 5 Series", {}, [],
+            json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "BMW 5 Series", "quantity": None}),
+            json.dumps({"reply": "بالطبيعة! شنو اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        system = self._reply_system(calls)
+        self.assertIn("RESPONSE_LANGUAGE: Arabic", system)
+        self.assertIn("RESPONSE_SCRIPT: Arabic", system)
+        self.assertIn("RESPONSE_STYLE: Tunisian Darija", system)
+
+    def test_arabizi_detector_result_passed_through(self):
+        _, calls = self._run(
+            "n7eb n3adi commande BMW 5 Series", {}, [],
+            json.dumps({"language": "ar", "script": "latin", "style": "arabizi", "is_language_question": False}),
+            json.dumps({"intent": "start_order", "product_name": "BMW 5 Series", "quantity": None}),
+            json.dumps({"reply": "Bel tab3! Chnowa t7eb tcommandi?", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        system = self._reply_system(calls)
+        self.assertIn("RESPONSE_LANGUAGE: Arabic", system)
+        self.assertIn("RESPONSE_SCRIPT: Latin", system)
+        self.assertIn("RESPONSE_STYLE: Tunisian Arabizi", system)
+
+    def test_mid_order_reply_context_and_no_intent_call(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False})
+            return json.dumps(
+                {"reply": "شكراً، ما هو رقم هاتفك؟", "order_ready": False, "order_details": {}},
+                ensure_ascii=False,
+            )
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message("proj", self.CATALOG, [], "Ali", {"product_name": "Nissan Altima"})
+
+        reply_call = _reply_call(calls)
+        self.assertIsNotNone(reply_call)
+        system = reply_call[0]["content"]
+        self.assertIn("PRODUCT: Nissan Altima", system)
+        self.assertIn("NEXT_FIELD: phone", system)
+        self.assertIn("RESPONSE_LANGUAGE: Arabic", system)
+        self.assertIn("ORDER_STATE:", system)
+        self.assertIn("Nom=Ali", system)
+        # En plein flux : jamais d'appel d'intention supplémentaire.
+        self.assertNotIn(INTENT_SYSTEM_PROMPT, [m[0]["content"] for m in calls])
+        # L'état déterministe et la transition restent inchangés.
+        self.assertEqual(result["order_details"].get("name"), "Ali")
+        self.assertEqual(result["order_details"].get("product_name"), "Nissan Altima")
+        self.assertIs(result["order_ready"], False)
+
+    def test_bot_history_sent_as_plain_text_not_fake_json(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": None})
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        history = [
+            {"sender": "bot", "text": "Bonjour ! Je suis l'assistant de votre boutique."},
+            {"sender": "user", "text": "أريد تقديم طلب Nissan Altima"},
+        ]
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", self.CATALOG, history, "oui", {})
+        reply_call = _reply_call(calls)
+        self.assertIsNotNone(reply_call)
+        assistant_msgs = [m for m in reply_call[1:-1] if m["role"] == "assistant"]
+        self.assertEqual(
+            [m["content"] for m in assistant_msgs],
+            ["Bonjour ! Je suis l'assistant de votre boutique."],
+        )
+
+
+class ReplyActionTests(TestCase):
+    """Phase 2 : le reply LLM reçoit une ACTION dynamique qui ne décrit que le
+    comportement du tour ACTUEL (le champ à demander, ou la confirmation, ou une
+    réponse naturelle), placée juste avant la spécification JSON. Le catalogue
+    n'est injecté que pour les réponses naturelles."""
+
+    def test_start_order_asks_only_name_and_forbids_other_fields(self):
+        action = build_reply_action(
+            {"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1},
+            {"product_name": "Nissan Altima"},
+            "name",
+        )
+        self.assertIn("La seule information à demander est le nom complet du client", action)
+        self.assertIn("Pose UNE SEULE question courte et naturelle", action)
+        self.assertIn("INTERDIT : ne demande jamais les autres champs de la commande", action)
+        self.assertIn("Ne parle jamais de disponibilité, de stock", action)
+        self.assertNotIn("téléphone", action)
+        self.assertNotIn("adresse", action)
+
+    def test_start_order_without_product_asks_product(self):
+        action = build_reply_action({"intent": "start_order"}, {"product_name": ""}, "product_name")
+        self.assertIn("aucun produit n'est encore choisi", action)
+        self.assertIn("quel produit il souhaite commander", action)
+        self.assertIn("Ne parle jamais de disponibilité", action)
+
+    def test_mid_order_asks_only_the_missing_field(self):
+        action = build_reply_action(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima", "name": "Amin", "phone": "45454343"},
+            "address",
+        )
+        self.assertIn("la seule information à demander est l'adresse de livraison du client", action)
+        self.assertIn("INTERDIT : ne demande jamais Nom ni Téléphone ni Email", action)
+        self.assertNotIn("numéro de téléphone", action)
+
+    def test_completed_order_recaps_and_confirms(self):
+        action = build_reply_action(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima", "name": "Amin", "phone": "45454343", "address": "Tunis", "email": "a@b.com"},
+            None,
+        )
+        self.assertIn("toutes les informations de la commande sont déjà collectées", action)
+        self.assertIn("Récapitule la commande et remercie le client", action)
+        self.assertIn("sans redemander d'information", action)
+
+    def test_product_inquiry_answers_naturally(self):
+        action = build_reply_action({"intent": "product_inquiry"}, {}, None)
+        self.assertIn("réponds naturellement", action)
+        self.assertIn("CATALOGUE", action)
+
+    def test_language_question_answers_naturally_and_keeps_state(self):
+        action = build_reply_action(
+            {"intent": "other"}, {"product_name": "Nissan Altima"}, "name", is_language_question=True
+        )
+        self.assertIn("question sur la langue", action)
+        self.assertIn("sans modifier la commande en cours", action)
+        self.assertNotIn("la seule information à demander", action)
+
+    def test_reply_requires_catalog_only_for_natural_replies(self):
+        self.assertTrue(reply_requires_catalog({"intent": "product_inquiry"}, None))
+        self.assertTrue(reply_requires_catalog({"intent": "greeting"}, None))
+        self.assertTrue(reply_requires_catalog({"intent": "greeting"}, "product_name"))
+        self.assertFalse(reply_requires_catalog({"intent": "start_order"}, "name"))
+        self.assertFalse(reply_requires_catalog({"intent": "other"}, "phone"))
+        self.assertFalse(reply_requires_catalog({"intent": "other"}, None))  # commande terminée
+        self.assertFalse(reply_requires_catalog({"intent": "other"}, "name", is_language_question=True))
+
+    def test_catalog_injected_only_for_natural_turns(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                intent = "start_order" if "commander" in messages[-1]["content"] else "greeting"
+                return json.dumps(
+                    {"intent": intent, "product_name": "Nissan Altima" if intent == "start_order" else "", "quantity": None}
+                )
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        catalog = [
+            {"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]},
+        ]
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", catalog, [], "je veux commander une Nissan Altima", {})
+        reply_system = _reply_call(calls)[0]["content"]
+        self.assertIn("ACTION :", reply_system)
+        self.assertNotIn("CATALOGUE DES PRODUITS", reply_system)
+
+        calls.clear()
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", catalog, [], "bonjour", {})
+        reply_system = _reply_call(calls)[0]["content"]
+        self.assertIn("CATALOGUE DES PRODUITS", reply_system)
+        self.assertIn("Nissan Altima", reply_system)
 
 
 class OrderCreationTests(TestCase):
@@ -351,3 +1362,650 @@ class HuggingFaceProviderTests(TestCase):
             )
         self.assertIn("Désolé", result["reply"])
         self.assertIs(result["order_ready"], False)
+
+
+class LanguagePromptContractTests(TestCase):
+    """Phase 3C : contrat déterministe du prompt de détection de langue et du filet
+    de sécurité script."""
+
+    def test_prompt_analyzes_whole_message(self):
+        self.assertIn("en entier", LANGUAGE_SYSTEM_PROMPT)
+        self.assertIn("ne te fie pas à un seul mot", LANGUAGE_SYSTEM_PROMPT)
+
+    def test_prompt_narrows_language_question(self):
+        self.assertIn("UNIQUEMENT", LANGUAGE_SYSTEM_PROMPT)
+        self.assertIn("JAMAIS des questions de langue", LANGUAGE_SYSTEM_PROMPT)
+        self.assertIn("do you speak arabic", LANGUAGE_SYSTEM_PROMPT)
+
+    def test_prompt_distinguishes_darija_and_arabizi(self):
+        self.assertIn("tunisian_darija", LANGUAGE_SYSTEM_PROMPT)
+        self.assertIn("arabizi", LANGUAGE_SYSTEM_PROMPT)
+        self.assertIn("n7eb n3adi commande", LANGUAGE_SYSTEM_PROMPT)
+
+    def test_script_consistency_arabic_message_overrides_latin(self):
+        result = detect_language(
+            "أريد شراء سيارة",
+            lambda messages: json.dumps(
+                {"language": "fr", "script": "latin", "style": "french", "is_language_question": False}
+            ),
+        )
+        self.assertEqual(result["script"], "arabic")
+        self.assertEqual(result["language"], "ar")
+        self.assertEqual(result["style"], "msa")
+
+    def test_script_consistency_preserves_arabizi(self):
+        result = detect_language(
+            "n7eb n3adi commande",
+            lambda messages: json.dumps(
+                {"language": "ar", "script": "latin", "style": "arabizi", "is_language_question": False}
+            ),
+        )
+        self.assertEqual(result["script"], "latin")
+        self.assertEqual(result["style"], "arabizi")
+
+    def test_script_consistency_preserves_french(self):
+        result = detect_language(
+            "bonjour",
+            lambda messages: json.dumps(
+                {"language": "fr", "script": "latin", "style": "french", "is_language_question": False}
+            ),
+        )
+        self.assertEqual(result["script"], "latin")
+        self.assertEqual(result["style"], "french")
+
+    def test_timeout_fallback_not_overridden_by_script_consistency(self):
+        def boom(messages, **kwargs):
+            raise requests.exceptions.Timeout("boom")
+
+        result = detect_language("أريد شراء سيارة", boom)
+        self.assertEqual(result, DEFAULT_LANGUAGE)
+        self.assertEqual(result["script"], "mixed")
+
+
+class DataOnlyLanguageContinuityTests(TestCase):
+    """Phase 3C : reconnaissance des messages data-only et source de langue pour
+    conserver le style de la conversation."""
+
+    def test_data_only_phone(self):
+        self.assertTrue(is_data_only_message("23456789"))
+        self.assertTrue(is_data_only_message("22123456"))
+
+    def test_data_only_email(self):
+        self.assertTrue(is_data_only_message("achref@gmail.com"))
+
+    def test_data_only_single_word(self):
+        self.assertTrue(is_data_only_message("أشرف"))
+        self.assertTrue(is_data_only_message("tunis"))
+        self.assertTrue(is_data_only_message("Achref"))
+
+    def test_not_data_only_sentence(self):
+        self.assertFalse(is_data_only_message("شنوما السعر متاع BMW 5 Series؟"))
+        self.assertFalse(is_data_only_message("mon nom est Achref"))
+        self.assertFalse(is_data_only_message("أريد تقديم طلب BMW"))
+
+    def test_data_only_empty(self):
+        self.assertTrue(is_data_only_message(""))
+        self.assertTrue(is_data_only_message("   "))
+
+    def test_pick_source_uses_last_language_bearing_user_message(self):
+        history = [
+            {"sender": "user", "text": "أريد تقديم طلب Nissan Altima"},
+            {"sender": "bot", "text": "بالتأكيد! ما هو اسمك الكامل؟"},
+            {"sender": "user", "text": "أمين"},
+        ]
+        self.assertEqual(pick_language_source_message(history, "tunis"), "أريد تقديم طلب Nissan Altima")
+
+    def test_pick_source_falls_back_when_all_history_data_only(self):
+        history = [
+            {"sender": "user", "text": "أمين"},
+            {"sender": "bot", "text": "شكراً!"},
+            {"sender": "user", "text": "23456789"},
+        ]
+        self.assertEqual(pick_language_source_message(history, "tunis"), "tunis")
+
+    def test_pick_source_uses_current_when_no_history(self):
+        self.assertEqual(pick_language_source_message([], "23456789"), "23456789")
+
+    def test_pick_source_uses_current_when_language_bearing(self):
+        self.assertEqual(pick_language_source_message([], "شنوما السعر؟"), "شنوما السعر؟")
+
+
+class IntentPromptContractTests(TestCase):
+    """Phase 3C : contrat déterministe du prompt d'intention (blended)."""
+
+    def test_prompt_keeps_start_order_broad_rule(self):
+        self.assertIn("dans n'importe quelle langue ou écriture", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_price_question_is_inquiry(self):
+        self.assertIn("product_inquiry, PAS start_order", INTENT_SYSTEM_PROMPT)
+        self.assertIn("wesh alay l prix", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_search_is_not_order(self):
+        self.assertIn("product_search, PAS start_order", INTENT_SYSTEM_PROMPT)
+        self.assertIn("chkoun ya3ref wino l fromage", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_complete_order_not_cancel(self):
+        self.assertIn("نحب نكمل الطلب", INTENT_SYSTEM_PROMPT)
+        self.assertIn("PAS cancel_order", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_generic_nouns_not_product(self):
+        self.assertIn("سيارة", INTENT_SYSTEM_PROMPT)
+        self.assertIn("sayara", INTENT_SYSTEM_PROMPT)
+        self.assertIn("laissés vides", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_keeps_json_contract(self):
+        self.assertIn('{"intent": "start_order", "product_name": "", "quantity": null}', INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_availability_question_is_not_order(self):
+        self.assertIn("3andkom pizza", INTENT_SYSTEM_PROMPT)
+        self.assertIn("عندكم", INTENT_SYSTEM_PROMPT)
+        self.assertIn("Mentionner un produit ne suffit jamais", INTENT_SYSTEM_PROMPT)
+
+    def test_prompt_start_order_requires_explicit_intent(self):
+        self.assertIn("start_order exige une intention explicite d'achat ou de commande", INTENT_SYSTEM_PROMPT)
+
+
+class RoutingGateTests(TestCase):
+    """Phase 3C : le flux de commande ne démarre que sur start_order."""
+
+    CATALOG = [
+        {"name": "Voitures", "products": [{"name": "BMW 5 Series", "price": "20000 €", "stock": 2}]},
+        {"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 3}]},
+    ]
+
+    def _run(self, message, intent_json, language_json, reply_json, state=None, catalog=None):
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=_chat_llm_factory(
+            intent=intent_json,
+            language=language_json,
+            reply=reply_json,
+        )):
+            return handle_chat_message("proj", catalog or self.CATALOG, [], message, state or {})
+
+    def test_price_inquiry_does_not_start_order(self):
+        result = self._run(
+            "شنوما السعر متاع BMW 5 Series؟",
+            json.dumps({"intent": "product_inquiry", "product_name": "", "quantity": None}),
+            json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False}),
+            json.dumps({"reply": "السعر موجود في الكتالوج.", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+        self.assertEqual(result["order_details"].get("name", ""), "")
+        self.assertIs(result["order_ready"], False)
+
+    def test_price_inquiry_with_mentioned_product_does_not_start_order(self):
+        result = self._run(
+            "شنوما السعر متاع BMW 5 Series؟",
+            json.dumps({"intent": "product_inquiry", "product_name": "BMW 5 Series", "quantity": None}),
+            json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False}),
+            json.dumps({"reply": "السعر موجود في الكتالوج.", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+
+    def test_start_order_populates_product(self):
+        result = self._run(
+            "أريد تقديم طلب BMW 5 Series",
+            json.dumps({"intent": "start_order", "product_name": "BMW 5 Series", "quantity": 1}),
+            json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}),
+            json.dumps({"reply": "بالتأكيد! ما هو اسمك الكامل؟", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(result["order_details"].get("product_name"), "BMW 5 Series")
+        self.assertIs(result["order_ready"], False)
+
+    def test_interrogative_start_order_does_not_inject_product(self):
+        # Phase 4 : une question de disponibilité ("3andkom pizza?") ne doit jamais
+        # injecter un produit dans la commande, même si le classificateur la classe
+        # start_order par erreur.
+        result = self._run(
+            "3andkom pizza?",
+            json.dumps({"intent": "start_order", "product_name": "pizza", "quantity": None}),
+            json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False}),
+            json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+        self.assertEqual(result["order_details"].get("quantity", 1), 1)
+
+    def test_interrogative_arabic_start_order_does_not_inject_product(self):
+        result = self._run(
+            "عندكم فرجيني؟",
+            json.dumps({"intent": "start_order", "product_name": "فرجيني", "quantity": None}),
+            json.dumps({"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False}),
+            json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False),
+        )
+        self.assertEqual(result["order_details"].get("product_name", ""), "")
+        self.assertIs(result["order_ready"], False)
+
+    def test_mid_order_collection_still_works(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False})
+            return json.dumps(
+                {"reply": "شكراً! ما هو رقم هاتفك؟", "order_ready": False, "order_details": {}},
+                ensure_ascii=False,
+            )
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            result = handle_chat_message("proj", self.CATALOG, [], "أمين", {"product_name": "BMW 5 Series"})
+        self.assertEqual(result["order_details"].get("name"), "أمين")
+        self.assertEqual(result["order_details"].get("product_name"), "BMW 5 Series")
+        self.assertIs(result["order_ready"], False)
+        self.assertNotIn(INTENT_SYSTEM_PROMPT, [m[0]["content"] for m in calls])
+
+
+class ReplyStyleExampleTests(TestCase):
+    """Phase 3C : sélection déterministe des exemples de style par tour."""
+
+    def test_french_ask_name_examples(self):
+        block = build_reply_style_examples(
+            {"intent": "start_order"},
+            {"product_name": "Nissan Altima"},
+            "name",
+            {"language": "fr", "script": "latin", "style": "french", "is_language_question": False},
+        )
+        self.assertIn("Quel est votre nom complet", block)
+
+    def test_msa_ask_name_examples(self):
+        block = build_reply_style_examples(
+            {"intent": "start_order"},
+            {"product_name": "Nissan Altima"},
+            "name",
+            {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False},
+        )
+        self.assertIn("ما هو اسمك الكامل", block)
+
+    def test_darija_ask_phone_examples(self):
+        block = build_reply_style_examples(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima", "name": "أمين"},
+            "phone",
+            {"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False},
+        )
+        self.assertIn("شنو رقم هاتفك", block)
+
+    def test_arabizi_ask_address_examples(self):
+        block = build_reply_style_examples(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima", "name": "Amin", "phone": "22123456"},
+            "address",
+            {"language": "ar", "script": "latin", "style": "arabizi", "is_language_question": False},
+        )
+        self.assertIn("Win t7eb", block)
+
+    def test_language_question_examples(self):
+        block = build_reply_style_examples(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima"},
+            "name",
+            {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": True},
+            True,
+        )
+        self.assertIn("التحدث بالعربية", block)
+
+    def test_natural_examples_for_inquiry(self):
+        block = build_reply_style_examples(
+            {"intent": "product_inquiry"},
+            {},
+            None,
+            {"language": "fr", "script": "latin", "style": "french", "is_language_question": False},
+        )
+        self.assertIn("Comment puis-je vous aider", block)
+
+    def test_recap_examples_for_completed_order(self):
+        block = build_reply_style_examples(
+            {"intent": "other"},
+            {"product_name": "Nissan Altima", "name": "Amin", "phone": "22123456", "address": "tunis", "email": "a@b.com"},
+            None,
+            {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False},
+        )
+        self.assertIn("تم تسجيل طلبك", block)
+
+    def test_style_block_injected_in_reply_prompt(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "start_order", "product_name": "Nissan Altima", "quantity": 1})
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False})
+            return json.dumps(
+                {"reply": "بالتأكيد! ما هو اسمك الكامل؟", "order_ready": False, "order_details": {}},
+                ensure_ascii=False,
+            )
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message(
+                "proj",
+                [{"name": "Voitures", "products": [{"name": "Nissan Altima", "price": "15000 €", "stock": 1}]}],
+                [],
+                "أود شراء سيارة",
+                {},
+            )
+        reply_system = _reply_call(calls)[0]["content"]
+        self.assertIn("EXEMPLES DE RÉPONSES DANS LE STYLE DU CLIENT", reply_system)
+        self.assertIn("ما هو اسمك الكامل", reply_system)
+
+    def test_examples_avoid_forbidden_phrases(self):
+        forbidden = (
+            "نحب نعدي كوموند",
+            "نحب نكمل الطلب",
+            "n7eb n3adi commande",
+            "أريد تقديم طلب",
+            "bel tab3",
+            "بالطبيعة",
+            "toyota corolla",
+            "Excellent choix !",
+            "Pour préparer votre commande",
+            "pourrais-je avoir votre nom",
+        )
+        blob = json.dumps(_REPLY_STYLE_EXAMPLES, ensure_ascii=False).lower()
+        for phrase in forbidden:
+            self.assertNotIn(phrase.lower(), blob)
+
+
+class LanguageAnchorSourceTests(TestCase):
+    """Phase 4 : un message qui porte de la langue ancre (ou change) la langue de
+    la conversation ; une simple valeur (produit nu, téléphone, email, mot court,
+    bruit) ne peut jamais la remplacer."""
+
+    CATALOG = [
+        {"name": "Voitures", "products": [
+            {"name": "Toyota Corolla", "price": "12000 €", "stock": 4},
+            {"name": "BMW 5 Series", "price": "20000 €", "stock": 2},
+        ]},
+    ]
+
+    def test_is_language_bearing_false_for_data_values(self):
+        for msg in ("675849848", "achref@gmail.com", "اشرف", "tunis", "`'(é-è_ç", "", "   "):
+            self.assertFalse(is_language_bearing_message(msg, self.CATALOG))
+
+    def test_is_language_bearing_false_for_bare_catalog_product(self):
+        self.assertFalse(is_language_bearing_message("Toyota Corolla", self.CATALOG))
+        self.assertFalse(is_language_bearing_message("BMW 5 Series", self.CATALOG))
+        self.assertFalse(is_language_bearing_message("Toyota Corolla !", self.CATALOG))
+
+    def test_is_language_bearing_true_for_sentences(self):
+        for msg in ("نحب نعدي كوموند", "شنوما الأسعار؟", "Je voudrais modifier mon adresse",
+                    "Can you help me?", "ما نحبش هذا المنتج"):
+            self.assertTrue(is_language_bearing_message(msg, self.CATALOG))
+
+    def test_sentence_containing_product_is_language_bearing(self):
+        for msg in ("نحب Toyota Corolla", "Je veux Toyota Corolla", "n7eb Toyota Corolla"):
+            self.assertTrue(is_language_bearing_message(msg, self.CATALOG))
+
+    def test_bare_product_never_establishes_anchor(self):
+        history = [
+            {"sender": "user", "text": "نحب نعدي كوموند"},
+            {"sender": "bot", "text": "حاضر! شنو تحب تطلب؟"},
+        ]
+        self.assertEqual(
+            pick_language_source_message(history, "Toyota Corolla", self.CATALOG), "نحب نعدي كوموند"
+        )
+        self.assertEqual(
+            pick_language_source_message(history, "BMW 5 Series", self.CATALOG), "نحب نعدي كوموند"
+        )
+
+    def test_sentence_with_product_is_its_own_source(self):
+        history = [{"sender": "user", "text": "نحب نعدي كوموند"}, {"sender": "bot", "text": "حاضر!"}]
+        for msg in ("نحب Toyota Corolla", "Je veux Toyota Corolla", "n7eb Toyota Corolla"):
+            self.assertEqual(pick_language_source_message(history, msg, self.CATALOG), msg)
+
+    def test_data_values_preserve_anchor(self):
+        history = [{"sender": "user", "text": "نحب نعدي كوموند"}, {"sender": "bot", "text": "حاضر!"}]
+        for msg in ("اشرف", "675849848", "mahdia", "achref@gmail.com", "`'(é-è_ç"):
+            self.assertEqual(pick_language_source_message(history, msg, self.CATALOG), "نحب نعدي كوموند")
+
+    def test_genuine_switch_updates_anchor(self):
+        history = [
+            {"sender": "user", "text": "نحب نعدي كوموند"},
+            {"sender": "bot", "text": "حاضر!"},
+            {"sender": "user", "text": "Je veux changer l'adresse"},
+            {"sender": "bot", "text": "Bien sûr !"},
+        ]
+        # Un numéro après le message français conserve la langue française.
+        self.assertEqual(
+            pick_language_source_message(history, "675849848", self.CATALOG),
+            "Je veux changer l'adresse",
+        )
+        # Et on peut rebasculer en arabe/darija.
+        history.append({"sender": "user", "text": "ما نعرفش"})
+        history.append({"sender": "bot", "text": "علاش؟"})
+        self.assertEqual(
+            pick_language_source_message(history, "achref@gmail.com", self.CATALOG), "ما نعرفش"
+        )
+
+    def test_most_recent_language_bearing_message_wins(self):
+        history = [
+            {"sender": "user", "text": "Je veux commander"},
+            {"sender": "bot", "text": "OK"},
+            {"sender": "user", "text": "نحب نعدي كوموند"},
+            {"sender": "bot", "text": "حاضر!"},
+            {"sender": "user", "text": "Toyota Corolla"},
+        ]
+        self.assertEqual(pick_language_source_message(history, "اشرف", self.CATALOG), "نحب نعدي كوموند")
+
+    def test_fallback_current_when_no_history(self):
+        self.assertEqual(pick_language_source_message([], "Toyota Corolla", self.CATALOG), "Toyota Corolla")
+        self.assertEqual(pick_language_source_message([], "675849848", self.CATALOG), "675849848")
+
+
+class ConversationLanguageContinuityTests(TestCase):
+    """Phase 4 : la langue de la conversation reste stable pendant une commande
+    quand l'utilisateur fournit uniquement des données (produit nu, nom, téléphone,
+    adresse, email). Le bug historique : "Toyota Corolla" classé français par le
+    détecteur faisait basculer toute la suite en français."""
+
+    CATALOG = [
+        {"name": "Voitures", "products": [
+            {"name": "Toyota Corolla", "price": "12000 €", "stock": 4},
+            {"name": "BMW 5 Series", "price": "20000 €", "stock": 2},
+        ]},
+    ]
+
+    def _assert_stable_flow(self, seed, default_lang, expect_lang, expect_style):
+        state = {}
+        history = []
+        detected_sources = []
+        metas = []
+        order_ready = None
+        for msg in (seed, "Toyota Corolla", "اشرف", "675849848", "mahdia", "achref@gmail.com"):
+            calls = []
+
+            def recorder(messages, **_kwargs):
+                calls.append(messages)
+                system = messages[0]["content"]
+                if system == INTENT_SYSTEM_PROMPT:
+                    current = messages[-1]["content"]
+                    if current == seed:
+                        return json.dumps({"intent": "start_order", "product_name": "", "quantity": None})
+                    return json.dumps({"intent": "start_order", "product_name": "Toyota Corolla", "quantity": 1})
+                if "détecteur de langue" in system:
+                    src = messages[-1]["content"]
+                    detected_sources.append(src)
+                    # Simule le bug historique : le détecteur classerait le produit
+                    # nu en français s'il lui était soumis.
+                    if src == "Toyota Corolla":
+                        return json.dumps({"language": "fr", "script": "latin", "style": "french",
+                                           "is_language_question": False})
+                    return json.dumps(default_lang)
+                return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+            with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+                result = handle_chat_message("proj", self.CATALOG, history, msg, state)
+            for key, value in (result.get("order_details") or {}).items():
+                if key == "quantity":
+                    if isinstance(value, int) and value >= 1:
+                        state[key] = value
+                elif isinstance(value, str) and value.strip():
+                    state[key] = value
+            rc = _reply_call(calls)
+            lang = re.search(r"RESPONSE_LANGUAGE: ([^\n]+)", rc[0]["content"]).group(1)
+            style = re.search(r"RESPONSE_STYLE: ([^\n]+)", rc[0]["content"]).group(1)
+            metas.append((lang, style))
+            order_ready = result.get("order_ready")
+            history.append({"sender": "user", "text": msg})
+            history.append({"sender": "bot", "text": result.get("reply", "")})
+        return detected_sources, metas, state, order_ready
+
+    def _assert_language_preserved(self, seed, default_lang, expect_lang, expect_style):
+        detected, metas, state, ready = self._assert_stable_flow(seed, default_lang, expect_lang, expect_style)
+        self.assertNotIn("Toyota Corolla", detected)
+        self.assertTrue(all(lang == expect_lang for lang, _ in metas), metas)
+        self.assertTrue(all(style == expect_style for _, style in metas), metas)
+        self.assertEqual(state.get("product_name"), "Toyota Corolla")
+        self.assertEqual(state.get("name"), "اشرف")
+        self.assertEqual(state.get("phone"), "675849848")
+        self.assertEqual(state.get("address"), "mahdia")
+        self.assertEqual(state.get("email"), "achref@gmail.com")
+        self.assertIs(ready, True)
+
+    def test_darija_flow_preserves_darija(self):
+        self._assert_language_preserved(
+            "نحب نعدي كوموند",
+            {"language": "ar", "script": "arabic", "style": "tunisian_darija", "is_language_question": False},
+            "Arabic", "Tunisian Darija",
+        )
+
+    def test_arabic_flow_preserves_msa(self):
+        self._assert_language_preserved(
+            "أريد تقديم طلب سيارة",
+            {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False},
+            "Arabic", "Modern Standard Arabic",
+        )
+
+    def test_french_flow_preserves_french(self):
+        self._assert_language_preserved(
+            "Je veux commander une voiture",
+            {"language": "fr", "script": "latin", "style": "french", "is_language_question": False},
+            "French", "French",
+        )
+
+    def test_arabizi_flow_preserves_arabizi(self):
+        self._assert_language_preserved(
+            "n7eb n3adi commande",
+            {"language": "ar", "script": "latin", "style": "arabizi", "is_language_question": False},
+            "Arabic", "Tunisian Arabizi",
+        )
+
+    def test_genuine_switch_mid_order(self):
+        state = {"product_name": "Toyota Corolla"}
+        history = [
+            {"sender": "user", "text": "نحب نعدي كوموند"},
+            {"sender": "bot", "text": "حاضر!"},
+        ]
+        sources = []
+
+        def lang_for(src):
+            if src == "نحب نعدي كوموند":
+                return {"language": "ar", "script": "arabic", "style": "tunisian_darija",
+                        "is_language_question": False}
+            if src == "Je veux changer l'adresse":
+                return {"language": "fr", "script": "latin", "style": "french", "is_language_question": False}
+            return {"language": "ar", "script": "arabic", "style": "msa", "is_language_question": False}
+
+        metas = []
+        for msg in ("Je veux changer l'adresse", "675849848"):
+            calls = []
+
+            def recorder(messages, **_kwargs):
+                calls.append(messages)
+                if "détecteur de langue" in messages[0]["content"]:
+                    src = messages[-1]["content"]
+                    sources.append(src)
+                    return json.dumps(lang_for(src))
+                return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+            with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+                handle_chat_message("proj", self.CATALOG, history, msg, state)
+            rc = _reply_call(calls)
+            metas.append(re.search(r"RESPONSE_LANGUAGE: ([^\n]+)", rc[0]["content"]).group(1))
+            history.append({"sender": "user", "text": msg})
+            history.append({"sender": "bot", "text": "ok"})
+        # Le message français change l'ancre, puis le numéro conserve le français.
+        self.assertEqual(metas, ["French", "French"])
+        self.assertEqual(sources, ["Je veux changer l'adresse", "Je veux changer l'adresse"])
+
+
+class CatalogAuthorityTests(TestCase):
+    """Phase 4 : le catalogue est la source de vérité des prix/stocks. Le reply ne
+    doit jamais être autorisé à inventer un prix, un stock ou un produit absent."""
+
+    def test_catalog_authority_rule_requires_catalog_facts(self):
+        block = _CATALOG_AUTHORITY.lower()
+        self.assertIn("catalogue", block)
+        self.assertIn("prix", block)
+        self.assertIn("stock", block)
+        self.assertIn("n'invente", block)
+        self.assertIn("ne le trouves pas", block)
+
+    def test_catalog_authority_block_appended_when_catalog_injected(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "greeting", "product_name": "", "quantity": None})
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", CATALOG, [], "bonjour", {})
+        rc = _reply_call(calls)
+        self.assertIn("CATALOGUE DES PRODUITS", rc[0]["content"])
+        self.assertIn("RÈGLE ANTI-HALLUCINATION", rc[0]["content"])
+
+    def test_catalog_authority_absent_during_order_flow(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", CATALOG, [], "Amin", {"product_name": "Champignons"})
+        rc = _reply_call(calls)
+        self.assertNotIn("CATALOGUE DES PRODUITS", rc[0]["content"])
+        self.assertNotIn("RÈGLE ANTI-HALLUCINATION", rc[0]["content"])
+
+    def test_not_in_catalog_fact_appended_for_unknown_inquiry(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "product_inquiry", "product_name": "riz", "quantity": None})
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", CATALOG, [], "combien coûte le riz ?", {})
+        rc = _reply_call(calls)
+        self.assertIn("aucun produit du CATALOGUE", rc[0]["content"])
+
+    def test_no_not_in_catalog_fact_when_catalog_product_mentioned(self):
+        calls = []
+
+        def recorder(messages, **_kwargs):
+            calls.append(messages)
+            system = messages[0]["content"]
+            if system == INTENT_SYSTEM_PROMPT:
+                return json.dumps({"intent": "product_inquiry", "product_name": "Champignons", "quantity": None})
+            if "détecteur de langue" in system:
+                return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
+            return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
+
+        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
+            handle_chat_message("proj", CATALOG, [], "combien coûtent les Champignons ?", {})
+        rc = _reply_call(calls)
+        self.assertNotIn("aucun produit du CATALOGUE", rc[0]["content"])

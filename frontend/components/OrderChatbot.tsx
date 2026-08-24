@@ -114,6 +114,10 @@ export default function OrderChatbot({
           const json = await res.json()
           pushMessage({ sender: "bot", text: `🎉 Votre commande n°#${json.order_id} a été validée avec succès !` })
           onDecrementStock(details.product_name)
+          // La commande est persistée : on remet l'état actif à vide. Ainsi les
+          // messages suivants ("شكرا", "merci", ...) ne recréent pas la commande
+          // et une nouvelle commande éventuelle repart de zéro.
+          orderStateRef.current = {}
         } else {
           let msg = "Votre commande n'a pas pu être validée. Veuillez réessayer."
           try {

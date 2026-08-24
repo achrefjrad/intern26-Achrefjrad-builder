@@ -29,6 +29,9 @@ from .services.site_generation import (
 )
 from .services.chatbot import (
     handle_chat_message,
+    build_reply_context,
+    build_reply_action,
+    reply_requires_catalog,
     normalize_order_state,
     apply_order_message,
     get_next_missing_field,
@@ -73,6 +76,9 @@ __all__ = [
     "_testimonials_section",
     "_stats_section",
     "handle_chat_message",
+    "build_reply_context",
+    "build_reply_action",
+    "reply_requires_catalog",
     "normalize_order_state",
     "apply_order_message",
     "get_next_missing_field",
