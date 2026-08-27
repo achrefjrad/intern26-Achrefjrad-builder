@@ -1,4 +1,4 @@
-﻿'use client'
+'use client'
 
 import { useState, useEffect, useRef } from "react"
 import type { SectionType, ProductData, CatalogCategoryData, HeroSectionData, OverlaySectionData, GallerySectionData, ColumnsSectionData, ColumnItem, ContentType } from "@/components/types"
@@ -17,6 +17,8 @@ import { ImageUploadModal } from "@/components/modals/ImageUploadModal"
 
 const API_URL = API_ENDPOINTS.config
 const GENERATE_URL = API_ENDPOINTS.generate
+const GENERATE_HOMEPAGE_URL = API_ENDPOINTS.generateHomepage
+const GENERATE_CATALOG_URL = API_ENDPOINTS.generateCatalog
 const UPLOAD_URL = API_ENDPOINTS.uploadImages
 const PROJECTS_URL = API_ENDPOINTS.projects
 
@@ -27,6 +29,7 @@ export default function BuilderPage() {
   const [aiLoaded, setAiLoaded] = useState(false)
   const [prompt, setPrompt] = useState("")
   const [regenerating, setRegenerating] = useState(false)
+  const [isCatalogLoading, setIsCatalogLoading] = useState(false)
   const [imageModal, setImageModal] = useState<ImageModalState>(null)
   const [activeSectionId, setActiveSectionId] = useState<string | null>(null)
   const [isFullScreen, setIsFullScreen] = useState(false)
@@ -44,6 +47,43 @@ export default function BuilderPage() {
   const [chatPrefill, setChatPrefill] = useState<string | null>(null)
   const aiAppliedRef = useRef(false)
 
+  const generateCatalogInBackground = async (
+    promptText: string,
+    sections: SectionInstance[],
+    theme: typeof configState.theme
+  ) => {
+    if (!promptText.trim()) return
+    setIsCatalogLoading(true)
+    try {
+      const navbarSec = sections.find((s) => s.type === "navbar")
+      const brandName = (navbarSec?.data as { brand_name?: string })?.brand_name || ""
+
+      const res = await fetch(GENERATE_CATALOG_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prompt: promptText.trim(),
+          brand_name: brandName,
+          theme,
+        }),
+      })
+
+      if (res.ok) {
+        const data = await res.json()
+        if (Array.isArray(data.catalog) && data.catalog.length) {
+          const nextCatalog = normalizeCatalog(data.catalog)
+          setCatalog(nextCatalog)
+          setToast({ type: "success", message: "Catalogue de produits généré !" })
+          setTimeout(() => setToast(null), 3500)
+        }
+      }
+    } catch {
+      // Background generation error handled gracefully
+    } finally {
+      setIsCatalogLoading(false)
+    }
+  }
+
   useEffect(() => {
     if (aiAppliedRef.current) return
     aiAppliedRef.current = true
@@ -55,9 +95,16 @@ export default function BuilderPage() {
           const ai = JSON.parse(aiConfigRaw) as AiConfig
           const { sections, theme } = sectionsFromAI(ai)
           setConfigState({ sections, theme })
-          if (Array.isArray(ai.catalog) && ai.catalog.length) setCatalog(normalizeCatalog(ai.catalog))
-          setPrompt(ai.original_prompt || "")
+          const currentPrompt = ai.original_prompt || ""
+          setPrompt(currentPrompt)
           setAiLoaded(true)
+
+          if (Array.isArray(ai.catalog) && ai.catalog.length) {
+            setCatalog(normalizeCatalog(ai.catalog))
+          } else if (ai.pending_catalog) {
+            void generateCatalogInBackground(currentPrompt, sections, theme)
+          }
+
           localStorage.removeItem("ai_generated_config")
           return
         } catch {
@@ -71,6 +118,9 @@ export default function BuilderPage() {
         const sections = (data.sections || []).map(normalizeSection).filter(Boolean) as SectionInstance[]
         if (sections.length) {
           setConfigState({ sections, theme: normalizeTheme(data.theme) })
+          if (Array.isArray(data.catalog) && data.catalog.length) {
+            setCatalog(normalizeCatalog(data.catalog))
+          }
           setPrompt(data.hero_banner?.original_prompt || "")
           return
         }
@@ -531,25 +581,30 @@ export default function BuilderPage() {
     setRegenerating(true)
     setToast(null)
     try {
-      const res = await fetch(GENERATE_URL, {
+      // Stage 1: Generate homepage only
+      const res = await fetch(GENERATE_HOMEPAGE_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ prompt: prompt.trim() }),
       })
       if (!res.ok) {
         setToast({ type: "error", message: "AI generation failed. Check the backend." })
+        setRegenerating(false)
         return
       }
       const data = await res.json()
       const { sections, theme } = sectionsFromAI(data)
       setConfigState({ sections, theme })
-      if (Array.isArray(data.catalog) && data.catalog.length) setCatalog(normalizeCatalog(data.catalog))
       setPrompt(data.original_prompt || prompt)
       setAiLoaded(true)
-      setToast({ type: "success", message: "Layout regenerated!" })
+      setRegenerating(false)
+      setToast({ type: "success", message: "Page d'accueil régénérée !" })
+      setTimeout(() => setToast(null), 3000)
+
+      // Stage 2: Generate catalog in background
+      void generateCatalogInBackground(data.original_prompt || prompt, sections, theme)
     } catch {
       setToast({ type: "error", message: "Network error." })
-    } finally {
       setRegenerating(false)
       setTimeout(() => setToast(null), 4000)
     }
@@ -700,6 +755,7 @@ export default function BuilderPage() {
               onProductChange={updateCatalogProduct}
               onSelectProduct={handleSelectProduct}
               onViewProductDetail={handleViewProductDetail}
+              isCatalogLoading={isCatalogLoading}
             />
           ) : (
             <ProductEditorPanel
@@ -736,6 +792,7 @@ export default function BuilderPage() {
           onDiscoverCategoryChange={setDiscoverCategory}
           onOpenProjects={openProjectsModal}
           onOrderProduct={handleOrderProduct}
+          isCatalogLoading={isCatalogLoading}
         />
         <OrderChatbot
           open={chatOpen}

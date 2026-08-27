@@ -16,6 +16,7 @@ export default function DiscoverSection({
   onSelectProduct,
   activeCategory,
   onActiveCategoryChange,
+  isCatalogLoading = false,
 }: {
   catalog: CatalogCategoryData[]
   onCategoryNameChange: (categoryIndex: number, name: string) => void
@@ -25,6 +26,7 @@ export default function DiscoverSection({
   onSelectProduct: (categoryIndex: number, productIndex: number) => void
   activeCategory: number
   onActiveCategoryChange: (categoryIndex: number) => void
+  isCatalogLoading?: boolean
 }) {
   const theme = useTheme()
   const safeIndex = Math.min(Math.max(activeCategory, 0), Math.max(catalog.length - 1, 0))
@@ -42,10 +44,20 @@ export default function DiscoverSection({
     <section className="py-16 px-6">
       <div className="max-w-7xl mx-auto">
         <div className="mb-10">
-          <h2 className="text-3xl md:text-4xl font-bold text-slate-900 tracking-tight">
-            <InlineTextEdit value={category?.name || "Produits"} onChange={(name) => onCategoryNameChange(safeIndex, name)} emptyPlaceholder="Catégorie" className="text-3xl md:text-4xl font-bold tracking-tight" ariaLabel="Category name" />
-          </h2>
-          <p className="mt-2 text-slate-500">Découvrez nos produits par catégorie.</p>
+          <div className="flex flex-wrap items-center justify-between gap-4">
+            <div>
+              <h2 className="text-3xl md:text-4xl font-bold text-slate-900 tracking-tight">
+                <InlineTextEdit value={category?.name || "Produits"} onChange={(name) => onCategoryNameChange(safeIndex, name)} emptyPlaceholder="Catégorie" className="text-3xl md:text-4xl font-bold tracking-tight" ariaLabel="Category name" />
+              </h2>
+              <p className="mt-2 text-slate-500">Découvrez nos produits par catégorie.</p>
+            </div>
+            {isCatalogLoading && (
+              <div className="inline-flex items-center gap-2 px-3 py-1.5 rounded-full bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-medium animate-pulse">
+                <span className="w-2 h-2 rounded-full bg-indigo-600 animate-ping" />
+                Génération des produits par l&apos;IA en arrière-plan...
+              </div>
+            )}
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-[260px_1fr] gap-8">
@@ -81,9 +93,17 @@ export default function DiscoverSection({
 
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
             {products.length === 0 ? (
-              <div className="col-span-full p-10 text-center border-2 border-dashed border-slate-200 rounded-xl">
-                <p className="text-sm font-medium text-slate-500">Aucun produit dans cette catégorie.</p>
-              </div>
+              isCatalogLoading ? (
+                <div className="col-span-full p-12 text-center border-2 border-dashed border-indigo-200 bg-indigo-50/40 rounded-2xl animate-pulse">
+                  <div className="w-8 h-8 mx-auto mb-3 rounded-full border-2 border-indigo-600 border-t-transparent animate-spin" />
+                  <p className="text-sm font-semibold text-indigo-900">Génération du catalogue en cours...</p>
+                  <p className="text-xs text-indigo-600 mt-1">Les produits générés par l&apos;IA vont apparaître automatiquement.</p>
+                </div>
+              ) : (
+                <div className="col-span-full p-10 text-center border-2 border-dashed border-slate-200 rounded-xl">
+                  <p className="text-sm font-medium text-slate-500">Aucun produit dans cette catégorie.</p>
+                </div>
+              )
             ) : (
               products.map((product, pi) => (
                 <div

@@ -1,6 +1,24 @@
 # Site Generation subpackage
-from .generator import generate_config
+from .generator import (
+    generate_config,
+    generate_homepage_config,
+    generate_catalog_config,
+    _normalize_config,
+    _normalize_homepage_config,
+    _normalize_catalog_only,
+)
 from .normalizer import _normalize_config, _normalize_catalog
+from .cache import (
+    detect_category,
+    get_cached_generation,
+    set_cached_generation,
+    clear_generation_cache,
+    normalize_text,
+    CATEGORY_DEFINITIONS,
+    calculate_prompt_similarity,
+    extract_core_tokens,
+    SIMILARITY_THRESHOLD,
+)
 from .section_mappers import (
     VALID_SECTION_TYPES,
     LAYOUT_STYLES,
@@ -16,8 +34,20 @@ from .section_mappers import (
 
 __all__ = [
     "generate_config",
+    "generate_homepage_config",
+    "generate_catalog_config",
     "_normalize_config",
+    "_normalize_homepage_config",
     "_normalize_catalog",
+    "detect_category",
+    "get_cached_generation",
+    "set_cached_generation",
+    "clear_generation_cache",
+    "normalize_text",
+    "CATEGORY_DEFINITIONS",
+    "calculate_prompt_similarity",
+    "extract_core_tokens",
+    "SIMILARITY_THRESHOLD",
     "VALID_SECTION_TYPES",
     "LAYOUT_STYLES",
     "CONTENT_TYPES",

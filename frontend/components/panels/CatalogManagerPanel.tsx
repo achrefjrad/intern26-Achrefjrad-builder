@@ -14,6 +14,7 @@ export function CatalogManagerPanel({
   onProductChange,
   onSelectProduct,
   onViewProductDetail,
+  isCatalogLoading = false,
 }: {
   catalog: CatalogCategoryData[]
   selectedProduct: { categoryIndex: number; productIndex: number } | null
@@ -21,6 +22,7 @@ export function CatalogManagerPanel({
   onProductChange: (categoryIndex: number, productIndex: number, patch: Partial<ProductData>) => void
   onSelectProduct: (categoryIndex: number, productIndex: number) => void
   onViewProductDetail: (categoryIndex: number, productIndex: number) => void
+  isCatalogLoading?: boolean
 }) {
   const [expanded, setExpanded] = useState<Record<number, boolean>>({})
   const totalProducts = catalog.reduce((sum, cat) => sum + cat.products.length, 0)
@@ -40,6 +42,13 @@ export function CatalogManagerPanel({
             {catalog.length} Catégories · {totalProducts} produits — cliquez sur un produit pour le repérer dans l&apos;aperçu.
           </p>
         </div>
+
+        {isCatalogLoading && (
+          <div className="mb-4 flex items-center gap-2.5 p-3 rounded-xl bg-indigo-50 border border-indigo-200 text-indigo-700 text-xs font-medium animate-pulse">
+            <span className="w-2 h-2 rounded-full bg-indigo-600 animate-ping" />
+            L&apos;IA génère actuellement votre catalogue en arrière-plan...
+          </div>
+        )}
 
         <div className="space-y-4">
           {catalog.map((cat, ci) => {

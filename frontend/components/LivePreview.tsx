@@ -1,4 +1,4 @@
-﻿'use client'
+'use client'
 
 import { useEffect, useRef, type ReactNode } from "react"
 import type {
@@ -52,6 +52,7 @@ export function LivePreview({
   onDiscoverCategoryChange,
   onOpenProjects,
   onOrderProduct,
+  isCatalogLoading = false,
 }: {
   configState: ConfigState
   aiLoaded: boolean
@@ -77,6 +78,7 @@ export function LivePreview({
   onDiscoverCategoryChange: (categoryIndex: number) => void
   onOpenProjects: () => void
   onOrderProduct: () => void
+  isCatalogLoading?: boolean
 }) {
   const gridClasses: Record<number, string> = {
     1: "grid grid-cols-1 max-w-xl mx-auto gap-8",
@@ -137,6 +139,9 @@ export function LivePreview({
               aria-pressed={currentPage === "discover"}
             >
               🛍️ Découvrir
+              {isCatalogLoading && (
+                <span className="w-1.5 h-1.5 rounded-full bg-indigo-400 animate-ping ml-0.5" title="Génération en cours..." />
+              )}
             </button>
           </div>
 
@@ -185,6 +190,7 @@ export function LivePreview({
             onSelectProduct={onSelectProduct}
             activeCategory={discoverCategory}
             onActiveCategoryChange={onDiscoverCategoryChange}
+            isCatalogLoading={isCatalogLoading}
           />
         ) : currentPage === "product_detail" ? (
           <ProductDetailSection

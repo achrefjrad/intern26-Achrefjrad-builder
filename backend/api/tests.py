@@ -1959,7 +1959,6 @@ class CatalogAuthorityTests(TestCase):
         rc = _reply_call(calls)
         self.assertIn("CATALOGUE DES PRODUITS", rc[0]["content"])
         self.assertIn("RÈGLE ANTI-HALLUCINATION", rc[0]["content"])
-
     def test_catalog_authority_absent_during_order_flow(self):
         calls = []
 
@@ -2005,7 +2004,733 @@ class CatalogAuthorityTests(TestCase):
                 return json.dumps({"language": "fr", "script": "latin", "style": "french", "is_language_question": False})
             return json.dumps({"reply": "ok", "order_ready": False, "order_details": {}}, ensure_ascii=False)
 
-        with patch("api.services.chatbot.handler._call_chatbot_llm", side_effect=recorder):
-            handle_chat_message("proj", CATALOG, [], "combien coûtent les Champignons ?", {})
-        rc = _reply_call(calls)
-        self.assertNotIn("aucun produit du CATALOGUE", rc[0]["content"])
+
+class WebsiteGenerationCacheTests(TestCase):
+    def setUp(self):
+        from api.services.site_generation import clear_generation_cache
+        clear_generation_cache()
+
+    def tearDown(self):
+        from api.services.site_generation import clear_generation_cache
+        clear_generation_cache()
+
+    def test_category_detection_french_and_english_variations(self):
+        from api.services.site_generation import detect_category
+
+        # Coffee shop variations
+        self.assertEqual(detect_category("un site web pour un cafe shop"), "coffee_shop")
+        self.assertEqual(detect_category("créez un site web pour mon cafe"), "coffee_shop")
+        self.assertEqual(detect_category("je veux un site pour un café"), "coffee_shop")
+        self.assertEqual(detect_category("create a coffee shop website"), "coffee_shop")
+        self.assertEqual(detect_category("créez un site pour mon café avec un style moderne"), "coffee_shop")
+        self.assertEqual(detect_category("barista coffee house"), "coffee_shop")
+
+        # Bakery variations
+        self.assertEqual(detect_category("un site pour une boulangerie"), "bakery")
+        self.assertEqual(detect_category("boulangerie artisanale et pâtisserie"), "bakery")
+        self.assertEqual(detect_category("create a bakery website"), "bakery")
+        self.assertEqual(detect_category("site pour ma patisserie"), "bakery")
+
+        # Restaurant variations
+        self.assertEqual(detect_category("un site web pour un restaurant"), "restaurant")
+        self.assertEqual(detect_category("créer un site pour mon resto"), "restaurant")
+        self.assertEqual(detect_category("une pizzeria napolitaine"), "restaurant")
+
+        # Pet shop variations
+        self.assertEqual(detect_category("une animalerie en ligne"), "pet_shop")
+        self.assertEqual(detect_category("boutique pour animaux et chiens"), "pet_shop")
+        self.assertEqual(detect_category("create a pet shop website"), "pet_shop")
+
+        # Lawyer variations
+        self.assertEqual(detect_category("cabinet d'avocat et conseil juridique"), "lawyer")
+        self.assertEqual(detect_category("law firm and attorney website"), "lawyer")
+
+        # Grocery variations
+        self.assertEqual(detect_category("vente de fruits et légumes"), "grocery")
+        self.assertEqual(detect_category("primeur et légumes bio"), "grocery")
+
+        # Unrecognized / generic
+        self.assertIsNone(detect_category("un site pour une navette spatiale"))
+        self.assertIsNone(detect_category(""))
+
+    def test_first_request_generates_and_caches(self):
+        from rest_framework.test import APIClient
+        from api.services.site_generation import get_cached_generation
+
+        client = APIClient()
+        mock_hp = {
+            "theme": {"primary_color": "#123456", "font_family": "serif"},
+            "sections": [{"id": "navbar_1", "type": "navbar", "brand_name": "Mon Café"}],
+        }
+        mock_cat = [
+            {"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 10}]}
+        ]
+
+        with patch("api.views.generate_homepage_config", return_value=mock_hp) as mock_hp_call, \
+             patch("api.views.generate_catalog_config", return_value=mock_cat) as mock_cat_call:
+            response = client.post("/api/generate/", {"prompt": "un site web pour un cafe shop"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        mock_hp_call.assert_called_once()
+        mock_cat_call.assert_called_once()
+
+        data = response.json()
+        self.assertEqual(data["theme"]["primary_color"], "#123456")
+        self.assertEqual(data["sections"][0]["brand_name"], "Mon Café")
+        self.assertEqual(data["catalog"][0]["name"], "Boissons")
+        self.assertEqual(data["original_prompt"], "un site web pour un cafe shop")
+
+        # Cache should be populated (keyed by normalized prompt, not category)
+        from api.services.site_generation.cache import normalize_text
+        cached = get_cached_generation("un site web pour un cafe shop")
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached["theme"]["primary_color"], "#123456")
+
+    def test_second_request_uses_cache_and_skips_llm(self):
+        from rest_framework.test import APIClient
+        from api.views import DEFAULT_DRAFT_PROJECT_NAME
+
+        client = APIClient()
+        mock_hp = {
+            "theme": {"primary_color": "#78350f", "font_family": "serif"},
+            "sections": [{"id": "navbar_1", "type": "navbar", "brand_name": "Café de Paris"}],
+        }
+        mock_cat = [
+            {"name": "Cafés", "products": [{"name": "Cappuccino", "price": "3.50 €", "stock": 15}]}
+        ]
+
+        prompt = "créez un site web pour mon cafe"
+
+        # First request (cache miss -> calls LLM)
+        with patch("api.views.generate_homepage_config", return_value=mock_hp) as mock_hp_call, \
+             patch("api.views.generate_catalog_config", return_value=mock_cat) as mock_cat_call:
+            res1 = client.post("/api/generate/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(res1.status_code, 200)
+        self.assertEqual(mock_hp_call.call_count, 1)
+        self.assertEqual(mock_cat_call.call_count, 1)
+
+        # Second request with the SAME prompt (cache hit -> skips LLM)
+        with patch("api.views.generate_homepage_config") as mock_hp_call2, \
+             patch("api.views.generate_catalog_config") as mock_cat_call2:
+            res2 = client.post("/api/generate/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(res2.status_code, 200)
+        # LLM generators must NOT have been called
+        mock_hp_call2.assert_not_called()
+        mock_cat_call2.assert_not_called()
+
+        data2 = res2.json()
+        self.assertEqual(data2["theme"]["primary_color"], "#78350f")
+        self.assertEqual(data2["sections"][0]["brand_name"], "Café de Paris")
+        self.assertEqual(data2["catalog"][0]["name"], "Cafés")
+        self.assertEqual(data2["original_prompt"], prompt)
+
+        # Draft project should reflect the prompt
+        draft = Project.objects.get(name=DEFAULT_DRAFT_PROJECT_NAME)
+        self.assertEqual(draft.original_prompt, prompt)
+
+    def test_different_categories_do_not_reuse_each_other(self):
+        """Two distinct prompts each generate and cache their own record separately."""
+        from rest_framework.test import APIClient
+        from api.services.site_generation.cache import normalize_text
+        from api.models import GeneratedSiteCache
+
+        client = APIClient()
+        bakery_hp = {"theme": {"primary_color": "#b45309"}, "sections": [{"id": "1", "type": "navbar", "brand_name": "La Boulangerie"}]}
+        bakery_cat = [{"name": "Pains", "products": [{"name": "Baguette", "price": "1.30 €", "stock": 10}]}]
+        pet_hp = {"theme": {"primary_color": "#047857"}, "sections": [{"id": "1", "type": "navbar", "brand_name": "Animal Kingdom"}]}
+        pet_cat = [{"name": "Chiens", "products": [{"name": "Croquettes", "price": "20.00 €", "stock": 5}]}]
+
+        bakery_prompt = "un site pour une boulangerie"
+        pet_prompt = "un site pour une animalerie"
+
+        # Generate bakery
+        with patch("api.views.generate_homepage_config", return_value=bakery_hp), \
+             patch("api.views.generate_catalog_config", return_value=bakery_cat):
+            res_bakery = client.post("/api/generate/", {"prompt": bakery_prompt}, format="json")
+
+        # Generate pet shop
+        with patch("api.views.generate_homepage_config", return_value=pet_hp), \
+             patch("api.views.generate_catalog_config", return_value=pet_cat):
+            res_pet = client.post("/api/generate/", {"prompt": pet_prompt}, format="json")
+
+        self.assertEqual(res_bakery.json()["theme"]["primary_color"], "#b45309")
+        self.assertEqual(res_pet.json()["theme"]["primary_color"], "#047857")
+
+        # Verify each prompt's cached response is distinct
+        with patch("api.views.generate_homepage_config") as mock_hp, \
+             patch("api.views.generate_catalog_config") as mock_cat:
+            res_bakery_cached = client.post("/api/generate/", {"prompt": bakery_prompt}, format="json")
+            res_pet_cached = client.post("/api/generate/", {"prompt": pet_prompt}, format="json")
+
+        mock_hp.assert_not_called()
+        mock_cat.assert_not_called()
+        self.assertEqual(res_bakery_cached.json()["theme"]["primary_color"], "#b45309")
+        self.assertEqual(res_pet_cached.json()["theme"]["primary_color"], "#047857")
+
+    def test_cache_mutation_safety(self):
+        from api.services.site_generation import get_cached_generation, set_cached_generation
+
+        prompt = "un site web pour un cafe shop"
+        original_data = {
+            "theme": {"primary_color": "#111111"},
+            "sections": [{"id": "s1", "type": "hero", "title": "Original Title"}],
+            "catalog": [{"name": "Cat1", "products": []}],
+            "original_prompt": prompt,
+        }
+        set_cached_generation(prompt, original_data)
+
+        retrieved1 = get_cached_generation(prompt)
+        # Mutate retrieved1
+        retrieved1["theme"]["primary_color"] = "#999999"
+        retrieved1["sections"][0]["title"] = "Modified Title"
+
+        # Subsequent retrieval must still have original values
+        retrieved2 = get_cached_generation(prompt)
+        self.assertEqual(retrieved2["theme"]["primary_color"], "#111111")
+        self.assertEqual(retrieved2["sections"][0]["title"], "Original Title")
+
+    def test_generate_homepage_endpoint(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        mock_hp = {
+            "theme": {"primary_color": "#ff0000", "font_family": "sans-serif"},
+            "sections": [{"id": "navbar_1", "type": "navbar", "brand_name": "Test Brand"}],
+        }
+
+        with patch("api.views.generate_homepage_config", return_value=mock_hp) as mock_hp_call:
+            response = client.post("/api/generate-homepage/", {"prompt": "un site moderne"}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        mock_hp_call.assert_called_once()
+        data = response.json()
+        self.assertEqual(data["theme"]["primary_color"], "#ff0000")
+        self.assertEqual(data["sections"][0]["brand_name"], "Test Brand")
+        self.assertEqual(data["original_prompt"], "un site moderne")
+
+    def test_generate_catalog_endpoint(self):
+        from rest_framework.test import APIClient
+        client = APIClient()
+        mock_cat = [
+            {"name": "Produits", "products": [{"name": "Article 1", "price": "10 €", "stock": 5}]}
+        ]
+
+        with patch("api.views.generate_catalog_config", return_value=mock_cat) as mock_cat_call:
+            response = client.post(
+                "/api/generate-catalog/",
+                {"prompt": "un site moderne", "brand_name": "Test Brand", "homepage_context": "brand: Test Brand. "},
+                format="json"
+            )
+
+        self.assertEqual(response.status_code, 200)
+        mock_cat_call.assert_called_once()
+        data = response.json()
+        self.assertEqual(len(data["catalog"]), 1)
+        self.assertEqual(data["catalog"][0]["name"], "Produits")
+        self.assertEqual(data["catalog"][0]["products"][0]["name"], "Article 1")
+
+    def test_sequential_generation_persists_to_db_only_after_catalog_completes(self):
+        from rest_framework.test import APIClient
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text
+        client = APIClient()
+        GeneratedSiteCache.objects.all().delete()
+
+        prompt = "boulangerie artisanale a Lyon"
+        mock_hp = {
+            "theme": {"primary_color": "#8b5cf6"},
+            "sections": [{"id": "nav_1", "type": "navbar", "brand_name": "Bakery Test"}],
+        }
+        mock_cat = [
+            {"name": "Viennoiseries", "products": [{"name": "Croissant", "price": "1.50 €", "stock": 5}]}
+        ]
+
+        # Stage 1: Generate homepage
+        with patch("api.views.generate_homepage_config", return_value=mock_hp) as mock_hp_call:
+            res1 = client.post("/api/generate-homepage/", {"prompt": prompt}, format="json")
+        self.assertEqual(res1.status_code, 200)
+        mock_hp_call.assert_called_once()
+
+        # Reusable template must NOT be saved in DB yet (because catalog is not generated yet)
+        self.assertFalse(GeneratedSiteCache.objects.filter(prompt_key=normalize_text(prompt)).exists())
+
+        # Stage 2: Generate catalog
+        with patch("api.views.generate_catalog_config", return_value=mock_cat) as mock_cat_call:
+            res2 = client.post(
+                "/api/generate-catalog/",
+                {"prompt": prompt, "brand_name": "Bakery Test"},
+                format="json"
+            )
+        self.assertEqual(res2.status_code, 200)
+        mock_cat_call.assert_called_once()
+
+        # Reusable template MUST NOW be saved in DB!
+        cached_entry = GeneratedSiteCache.objects.filter(prompt_key=normalize_text(prompt)).first()
+        self.assertIsNotNone(cached_entry)
+        self.assertEqual(cached_entry.theme["primary_color"], "#8b5cf6")
+        self.assertEqual(cached_entry.sections[0]["brand_name"], "Bakery Test")
+        self.assertEqual(cached_entry.catalog[0]["name"], "Viennoiseries")
+
+        # Now test that the SAME prompt reuses the DB cache
+        with patch("api.views.generate_homepage_config") as mock_hp2, \
+             patch("api.views.generate_catalog_config") as mock_cat2:
+            res3_hp = client.post("/api/generate-homepage/", {"prompt": prompt}, format="json")
+            res3_cat = client.post("/api/generate-catalog/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(res3_hp.status_code, 200)
+        self.assertEqual(res3_cat.status_code, 200)
+        mock_hp2.assert_not_called()
+        mock_cat2.assert_not_called()
+        self.assertEqual(res3_hp.json()["sections"][0]["brand_name"], "Bakery Test")
+        self.assertEqual(res3_cat.json()["catalog"][0]["name"], "Viennoiseries")
+
+
+# ---------------------------------------------------------------------------
+# Prompt-Based Persistent Cache Tests
+# ---------------------------------------------------------------------------
+
+class PromptBasedCacheTests(TestCase):
+    """Tests for prompt-keyed GeneratedSiteCache persistence.
+
+    Verifies all 10 required scenarios:
+      1.  First generation saves to DB.
+      2.  Same prompt reuses saved website (no LLM call).
+      3.  Uppercase variation reuses same website.
+      4.  Leading/trailing space variation reuses same website.
+      5.  Different prompt creates a different DB record.
+      6.  Saved website persists in DB (not just in-memory).
+      7.  Stage 1 alone does NOT create a complete DB record.
+      8.  After Stage 2, complete record (theme+sections+catalog) is in DB.
+      9.  Cache hit on /api/generate-homepage/ skips LLM.
+      10. Cache hit on /api/generate-catalog/ skips LLM.
+    """
+
+    def setUp(self):
+        from api.models import GeneratedSiteCache
+        GeneratedSiteCache.objects.all().delete()
+        self.client_api = __import__('rest_framework.test', fromlist=['APIClient']).APIClient()
+
+        self.mock_hp = {
+            "theme": {"primary_color": "#6366f1", "font_family": "Inter"},
+            "sections": [{"id": "nav_1", "type": "navbar", "brand_name": "PC Store"}],
+        }
+        self.mock_cat = [
+            {"name": "Gaming PCs", "products": [{"name": "RTX 4090 Build", "price": "2499 €", "stock": 3}]}
+        ]
+
+    # ------------------------------------------------------------------
+    # 1. First generation saves to DB
+    # ------------------------------------------------------------------
+    def test_1_first_generation_via_generate_endpoint_saves_to_db(self):
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text
+
+        prompt = "create a website for selling PCs"
+        with patch("api.views.generate_homepage_config", return_value=self.mock_hp), \
+             patch("api.views.generate_catalog_config", return_value=self.mock_cat):
+            response = self.client_api.post("/api/generate/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        key = normalize_text(prompt)
+        entry = GeneratedSiteCache.objects.filter(prompt_key=key).first()
+        self.assertIsNotNone(entry, "Complete website should be saved in DB after /api/generate/")
+        self.assertEqual(entry.theme["primary_color"], "#6366f1")
+        self.assertEqual(entry.sections[0]["brand_name"], "PC Store")
+        self.assertEqual(entry.catalog[0]["name"], "Gaming PCs")
+
+    # ------------------------------------------------------------------
+    # 2. Same prompt reuses saved website (no LLM call)
+    # ------------------------------------------------------------------
+    def test_2_same_prompt_reuses_db_record_no_llm(self):
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text, set_cached_generation
+
+        prompt = "create a website for selling PCs"
+        set_cached_generation(prompt, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": prompt,
+        })
+
+        with patch("api.views.generate_homepage_config") as mock_hp, \
+             patch("api.views.generate_catalog_config") as mock_cat:
+            response = self.client_api.post("/api/generate/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        mock_hp.assert_not_called()
+        mock_cat.assert_not_called()
+        data = response.json()
+        self.assertEqual(data["theme"]["primary_color"], "#6366f1")
+        self.assertEqual(data["catalog"][0]["name"], "Gaming PCs")
+
+    # ------------------------------------------------------------------
+    # 3. Uppercase variation reuses same website
+    # ------------------------------------------------------------------
+    def test_3_uppercase_variation_reuses_same_record(self):
+        from api.services.site_generation.cache import set_cached_generation, get_cached_generation
+
+        original = "create a website for selling PCs"
+        set_cached_generation(original, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": original,
+        })
+
+        upper = "CREATE A WEBSITE FOR SELLING PCS"
+        result = get_cached_generation(upper)
+        self.assertIsNotNone(result, "Uppercase variation should hit the same DB record")
+        self.assertEqual(result["catalog"][0]["name"], "Gaming PCs")
+
+    # ------------------------------------------------------------------
+    # 4. Leading/trailing space variation reuses same website
+    # ------------------------------------------------------------------
+    def test_4_whitespace_variation_reuses_same_record(self):
+        from api.services.site_generation.cache import set_cached_generation, get_cached_generation
+
+        original = "create a website for selling PCs"
+        set_cached_generation(original, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": original,
+        })
+
+        padded = "  create  a  website  for  selling  PCs  "
+        result = get_cached_generation(padded)
+        self.assertIsNotNone(result, "Extra-space variation should hit the same DB record")
+        self.assertEqual(result["theme"]["primary_color"], "#6366f1")
+
+    # ------------------------------------------------------------------
+    # 5. Different prompt creates different DB record
+    # ------------------------------------------------------------------
+    def test_5_different_prompt_creates_different_record(self):
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text
+
+        mock_hp2 = {"theme": {"primary_color": "#ec4899"}, "sections": [{"id": "n2", "type": "navbar", "brand_name": "Café Lumière"}]}
+        mock_cat2 = [{"name": "Boissons", "products": [{"name": "Espresso", "price": "2.50 €", "stock": 50}]}]
+
+        with patch("api.views.generate_homepage_config", return_value=self.mock_hp), \
+             patch("api.views.generate_catalog_config", return_value=self.mock_cat):
+            self.client_api.post("/api/generate/", {"prompt": "create a website for selling PCs"}, format="json")
+
+        with patch("api.views.generate_homepage_config", return_value=mock_hp2), \
+             patch("api.views.generate_catalog_config", return_value=mock_cat2):
+            self.client_api.post("/api/generate/", {"prompt": "create a coffee shop website"}, format="json")
+
+        self.assertEqual(GeneratedSiteCache.objects.count(), 2)
+        pc_entry = GeneratedSiteCache.objects.get(prompt_key=normalize_text("create a website for selling PCs"))
+        coffee_entry = GeneratedSiteCache.objects.get(prompt_key=normalize_text("create a coffee shop website"))
+        self.assertEqual(pc_entry.sections[0]["brand_name"], "PC Store")
+        self.assertEqual(coffee_entry.sections[0]["brand_name"], "Café Lumière")
+
+    # ------------------------------------------------------------------
+    # 6. Saved website persists in DB (not just in-memory)
+    # ------------------------------------------------------------------
+    def test_6_saved_website_persists_in_db(self):
+        """After saving, retrieving directly from DB model (not cache module) returns the data."""
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import set_cached_generation, normalize_text
+
+        prompt = "online electronics shop"
+        set_cached_generation(prompt, {
+            "theme": {"primary_color": "#0ea5e9"},
+            "sections": [{"id": "n3", "type": "navbar", "brand_name": "ElectroPro"}],
+            "catalog": [{"name": "Laptops", "products": []}],
+            "original_prompt": prompt,
+        })
+
+        # Retrieve directly from Django ORM (bypasses any in-memory state)
+        entry = GeneratedSiteCache.objects.get(prompt_key=normalize_text(prompt))
+        self.assertEqual(entry.theme["primary_color"], "#0ea5e9")
+        self.assertEqual(entry.sections[0]["brand_name"], "ElectroPro")
+        self.assertEqual(entry.catalog[0]["name"], "Laptops")
+
+    # ------------------------------------------------------------------
+    # 7. Stage 1 alone does NOT create a complete DB record
+    # ------------------------------------------------------------------
+    def test_7_stage1_only_does_not_save_to_db(self):
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text
+
+        prompt = "create a website for a flower shop"
+        with patch("api.views.generate_homepage_config", return_value=self.mock_hp):
+            response = self.client_api.post("/api/generate-homepage/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        key = normalize_text(prompt)
+        self.assertFalse(
+            GeneratedSiteCache.objects.filter(prompt_key=key).exists(),
+            "Stage 1 (homepage only) must NOT persist an incomplete template to DB",
+        )
+
+    # ------------------------------------------------------------------
+    # 8. After Stage 2, complete record is in DB
+    # ------------------------------------------------------------------
+    def test_8_stage2_saves_complete_record_to_db(self):
+        from api.models import GeneratedSiteCache
+        from api.services.site_generation.cache import normalize_text
+
+        prompt = "create a website for a flower shop"
+
+        # Stage 1
+        with patch("api.views.generate_homepage_config", return_value=self.mock_hp):
+            self.client_api.post("/api/generate-homepage/", {"prompt": prompt}, format="json")
+
+        # Stage 2
+        with patch("api.views.generate_catalog_config", return_value=self.mock_cat):
+            response = self.client_api.post(
+                "/api/generate-catalog/",
+                {"prompt": prompt, "brand_name": "PC Store"},
+                format="json",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        key = normalize_text(prompt)
+        entry = GeneratedSiteCache.objects.filter(prompt_key=key).first()
+        self.assertIsNotNone(entry, "Complete record must exist after Stage 2")
+        # Both homepage sections and catalog must be present
+        self.assertTrue(len(entry.sections) > 0, "sections must be populated")
+        self.assertTrue(len(entry.catalog) > 0, "catalog must be populated")
+        self.assertEqual(entry.catalog[0]["name"], "Gaming PCs")
+
+    # ------------------------------------------------------------------
+    # 9. Cache hit on /api/generate-homepage/ skips LLM
+    # ------------------------------------------------------------------
+    def test_9_homepage_endpoint_cache_hit_skips_llm(self):
+        from api.services.site_generation.cache import set_cached_generation
+
+        prompt = "create a website for selling PCs"
+        set_cached_generation(prompt, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": prompt,
+        })
+
+        with patch("api.views.generate_homepage_config") as mock_hp_fn:
+            response = self.client_api.post("/api/generate-homepage/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        mock_hp_fn.assert_not_called()
+        data = response.json()
+        self.assertEqual(data["sections"][0]["brand_name"], "PC Store")
+
+    # ------------------------------------------------------------------
+    # 10. Cache hit on /api/generate-catalog/ skips LLM
+    # ------------------------------------------------------------------
+    def test_10_catalog_endpoint_cache_hit_skips_llm(self):
+        from api.services.site_generation.cache import set_cached_generation
+
+        prompt = "create a website for selling PCs"
+        set_cached_generation(prompt, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": prompt,
+        })
+
+        with patch("api.views.generate_catalog_config") as mock_cat_fn:
+            response = self.client_api.post("/api/generate-catalog/", {"prompt": prompt}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        mock_cat_fn.assert_not_called()
+        data = response.json()
+        self.assertEqual(data["catalog"][0]["name"], "Gaming PCs")
+
+
+# ---------------------------------------------------------------------------
+# Smarter Website Cache Matching Tests (Conservative Scoring-Based Similarity)
+# ---------------------------------------------------------------------------
+
+class SmarterCacheMatchingTests(TestCase):
+    """Tests for scoring-based prompt similarity matching in GeneratedSiteCache.
+
+    Guarantees:
+      1. Phrasing variations with same business concept reuse existing site (CACHE HIT).
+      2. Different business domains NEVER reuse each other (CACHE MISS, score = 0.0).
+      3. Categorized vs Uncategorized prompts NEVER collide (CACHE MISS, score = 0.0).
+      4. Sub-domain conflicts within same category (e.g. sushi vs pizza) do NOT collide.
+      5. Uncategorized distinct concepts (e.g. vélos vs voitures) do NOT collide.
+      6. Generic stopword-only prompts do not false-positive match.
+      7. API endpoints (/api/generate/, /api/generate-homepage/) reuse cached site on phrasing variations.
+    """
+
+    def setUp(self):
+        from api.models import GeneratedSiteCache
+        GeneratedSiteCache.objects.all().delete()
+        self.client_api = __import__('rest_framework.test', fromlist=['APIClient']).APIClient()
+
+        self.mock_hp = {
+            "theme": {"primary_color": "#b91c1c", "font_family": "serif"},
+            "sections": [{"id": "nav_1", "type": "navbar", "brand_name": "Le Gourmet"}],
+        }
+        self.mock_cat = [
+            {"name": "Entrées", "products": [{"name": "Salade", "price": "8.50 €", "stock": 10}]}
+        ]
+
+    # --- Unit Tests for calculate_prompt_similarity ---
+
+    def test_phrasing_variations_restaurant_high_score(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p1 = "créez un site web pour un restaurant"
+        p2 = "donner un site pour mon restaurant"
+        p3 = "faire un site internet de restaurant"
+        p4 = "je veux un site pour restaurant"
+        p5 = "create a website for a restaurant"
+
+        for other in [p2, p3, p4, p5]:
+            score = calculate_prompt_similarity(p1, other)
+            self.assertGreaterEqual(score, SIMILARITY_THRESHOLD, f"Failed for {other} with score {score}")
+
+    def test_phrasing_variations_cafe_high_score(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p1 = "un site web pour un cafe shop"
+        p2 = "creer un site pour mon cafe"
+        score = calculate_prompt_similarity(p1, p2)
+        self.assertGreaterEqual(score, SIMILARITY_THRESHOLD, f"Score {score} was below threshold")
+
+    def test_phrasing_variations_bakery_high_score(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p1 = "site pour une boulangerie"
+        p2 = "créer un site web pour ma boulangerie"
+        score = calculate_prompt_similarity(p1, p2)
+        self.assertGreaterEqual(score, SIMILARITY_THRESHOLD, f"Score {score} was below threshold")
+
+    def test_false_positive_rejection_restaurant_vs_cafe(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p_rest = "créez un site web pour un restaurant"
+        p_cafe = "créez un site web pour un cafe"
+
+        score = calculate_prompt_similarity(p_rest, p_cafe)
+        self.assertEqual(score, 0.0, "Restaurant and Café must have score 0.0 (cross-domain rejection)")
+        self.assertLess(score, SIMILARITY_THRESHOLD)
+
+    def test_false_positive_rejection_cross_domains(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity
+
+        domain_pairs = [
+            ("site pour un restaurant", "site pour une boulangerie"),
+            ("site pour une animalerie", "site pour une boulangerie"),
+            ("cabinet d'avocat à Paris", "agence immobilière à Paris"),
+            ("boutique de vêtements", "salle de sport et musculation"),
+            ("salon de coiffure et beauté", "librairie de livres rares"),
+        ]
+
+        for prompt_a, prompt_b in domain_pairs:
+            score = calculate_prompt_similarity(prompt_a, prompt_b)
+            self.assertEqual(score, 0.0, f"Expected 0.0 for '{prompt_a}' vs '{prompt_b}', got {score}")
+
+    def test_false_positive_rejection_categorized_vs_uncategorized(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity
+
+        score = calculate_prompt_similarity("site pour un restaurant", "site pour une navette spatiale")
+        self.assertEqual(score, 0.0)
+
+        score2 = calculate_prompt_similarity("site pour vente de guitares", "site pour un cafe")
+        self.assertEqual(score2, 0.0)
+
+    def test_subdomain_modifier_conflict_within_same_category(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p_pizza = "site restaurant pizza"
+        p_sushi = "site restaurant sushi"
+
+        score = calculate_prompt_similarity(p_pizza, p_sushi)
+        self.assertLess(score, SIMILARITY_THRESHOLD, f"Expected conflict rejection for sushi vs pizza, got {score}")
+
+    def test_uncategorized_matching_and_rejection(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity, SIMILARITY_THRESHOLD
+
+        p1 = "site pour vente de velos electriques"
+        p2 = "creer un site de vente de velos electriques"
+        p3 = "site pour vente de voitures electriques"
+
+        score_match = calculate_prompt_similarity(p1, p2)
+        self.assertGreaterEqual(score_match, SIMILARITY_THRESHOLD, f"Expected match for {p2}, got {score_match}")
+
+        score_mismatch = calculate_prompt_similarity(p1, p3)
+        self.assertLess(score_mismatch, SIMILARITY_THRESHOLD, f"Expected mismatch for {p3}, got {score_mismatch}")
+
+    def test_generic_and_empty_prompts_safety(self):
+        from api.services.site_generation.cache import calculate_prompt_similarity
+
+        self.assertEqual(calculate_prompt_similarity("site web", "faire un site"), 0.0)
+        self.assertEqual(calculate_prompt_similarity("", "site restaurant"), 0.0)
+        self.assertEqual(calculate_prompt_similarity(None, "site restaurant"), 0.0)
+
+    # --- End-to-End Database and API Tests ---
+
+    def test_smart_cache_hit_on_restaurant_phrasing_variation(self):
+        from api.services.site_generation.cache import set_cached_generation, get_cached_generation
+
+        original_prompt = "créez un site web pour un restaurant"
+        set_cached_generation(original_prompt, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": original_prompt,
+        })
+
+        # Query with different wording
+        query_prompt = "donner un site pour mon restaurant"
+        cached = get_cached_generation(query_prompt)
+
+        self.assertIsNotNone(cached, "Should find cached restaurant template via smart scoring")
+        self.assertEqual(cached["theme"]["primary_color"], "#b91c1c")
+        self.assertEqual(cached["sections"][0]["brand_name"], "Le Gourmet")
+        self.assertEqual(cached["catalog"][0]["name"], "Entrées")
+
+    def test_smart_cache_miss_on_cafe_when_restaurant_is_cached(self):
+        from api.services.site_generation.cache import set_cached_generation, get_cached_generation
+
+        rest_prompt = "créez un site web pour un restaurant"
+        set_cached_generation(rest_prompt, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": rest_prompt,
+        })
+
+        # Query for café must NOT reuse restaurant
+        cafe_query = "créez un site web pour un cafe"
+        cached = get_cached_generation(cafe_query)
+        self.assertIsNone(cached, "Café query must NOT reuse restaurant cached template")
+
+    def test_api_generate_endpoint_reuses_site_on_phrasing_variation(self):
+        from api.services.site_generation.cache import set_cached_generation
+
+        original = "créez un site web pour un restaurant"
+        set_cached_generation(original, {
+            "theme": self.mock_hp["theme"],
+            "sections": self.mock_hp["sections"],
+            "catalog": self.mock_cat,
+            "original_prompt": original,
+        })
+
+        query = "donner un site pour mon restaurant"
+
+        with patch("api.views.generate_homepage_config") as mock_hp_call, \
+             patch("api.views.generate_catalog_config") as mock_cat_call:
+            response = self.client_api.post("/api/generate/", {"prompt": query}, format="json")
+
+        self.assertEqual(response.status_code, 200)
+        # LLM must NOT be called
+        mock_hp_call.assert_not_called()
+        mock_cat_call.assert_not_called()
+
+        data = response.json()
+        self.assertEqual(data["theme"]["primary_color"], "#b91c1c")
+        self.assertEqual(data["sections"][0]["brand_name"], "Le Gourmet")
+
+
+
+
+

@@ -1,4 +1,4 @@
-﻿import uuid
+import uuid
 from django.db import models
 
 
@@ -83,3 +83,26 @@ class OrderLine(models.Model):
 
     def __str__(self):
         return f"{self.quantity}x {self.product.name}"
+
+
+class GeneratedSiteCache(models.Model):
+    """Persistent reusable website template keyed by normalized user prompt.
+
+    prompt_key  — normalized (lowercase, no accents, collapsed whitespace) version of the
+                  original prompt; used as the unique lookup key.
+    category    — optional detected business category (e.g. 'coffee_shop', 'bakery').
+                  Stored as metadata only; NOT used as a lookup key.
+    """
+    prompt_key = models.CharField(max_length=512, unique=True, db_index=True)
+    category = models.CharField(max_length=100, blank=True, default='', db_index=True)
+    theme = models.JSONField(default=dict, blank=True)
+    sections = models.JSONField(default=list, blank=True)
+    catalog = models.JSONField(default=list, blank=True)
+    original_prompt = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        label = self.category or self.prompt_key[:60]
+        return f"Template [{label}]"
+

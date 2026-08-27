@@ -1,4 +1,4 @@
-﻿import type {
+import type {
   HeroSectionData,
   ColumnsSectionData,
   GallerySectionData,
@@ -151,6 +151,7 @@ export type AiConfig = {
   overlay_image_url?: string
   catalog?: AiCatalogCategory[]
   original_prompt?: string
+  pending_catalog?: boolean
 }
 
 // ── Serialization payload shapes ─────────────────────────────────────────────

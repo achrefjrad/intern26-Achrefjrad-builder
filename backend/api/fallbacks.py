@@ -222,7 +222,7 @@ def _fallback_catalog(prompt: str = "") -> list:
                 _product("Gnocchis au Gorgonzola", "14.50 €", "gnocchi", description="Gnocchis moelleux nappés d'une sauce gorgonzola crémeuse."),
             ]},
             {"name": "Desserts Maison", "products": [
-                _product("Tiramisu Maison", "6.50 €", "tiramisu dessert", description="Le dessert italien par excellence : mascarpone, café et cacao."),
+                _product("Tiramisu Maison", "6.50 €", "tiramisu dessert", description="Le dessert italien par excellence : mascarpone, café et cacao."),
                 _product("Panna Cotta", "5.90 €", "panna cotta", description="Une panna cotta onctueuse accompagnée de coulis de fruits rouges."),
                 _product("Tarte de la Maison", "24.90 €", "fruit tart", description="Une tarte gourmande composée de fruits de saison."),
                 _product("Cannoli Siciliani", "6.90 €", "cannoli", description="Deux cannolis croustillants fourrés à la ricotta sucrée."),
@@ -230,12 +230,47 @@ def _fallback_catalog(prompt: str = "") -> list:
                 _product("Panna Cotta Chocolat", "6.20 €", "chocolate panna cotta", description="Une variante gourmande au chocolat noir intense."),
             ]},
             {"name": "Menus & Formules", "products": [
-                _product("Menu Dégustation", "28.00 €", "tasting menu", description="Un parcours gourmand : entrée, plat et dessert au choix."),
+                _product("Menu Dégustation", "28.00 €", "tasting menu", description="Un parcours gourmand : entrée, plat et dessert au choix."),
                 _product("Formule Midi", "16.90 €", "lunch menu", description="Plat du jour, dessert et boisson à prix doux."),
                 _product("Menu Enfant", "9.50 €", "kids menu", description="Pizza ou pâtes, glace et boisson pour les petits gourmets."),
                 _product("Coffret Apéritif Italien", "22.00 €", "italian antipasti", description="Un assortiment d'antipasti, charcuteries et fromages italiens."),
                 _product("Panettone de Noël", "18.90 €", "panettone", description="Le grand classique milanais aux fruits confits."),
                 _product("Carte des Vins Dégustation", "35.00 €", "wine tasting", description="Trois verres de vins italiens sélectionnés par notre sommelier."),
+            ]},
+        ]
+    if any(k in p for k in ["coffee", "café", "coffee shop", "barista", "espresso"]):
+        return [
+            {"name": "Cafés & Expressos", "products": [
+                _product("Espresso Classique", "2.50 €", "espresso coffee", description="Un espresso intense et aromatique, extrait lentement pour un goût parfait."),
+                _product("Cappuccino Onctueux", "3.80 €", "cappuccino", description="Espresso, lait chaud et mousse légère pour un moment de douceur."),
+                _product("Flat White", "4.20 €", "flat white coffee", description="Double ristretto et lait micro-mousse pour les vrais amateurs de café."),
+                _product("Latte Maison", "4.00 €", "latte coffee", description="Un latte crémeux préparé avec notre mélange de grains sélectionnés."),
+                _product("Cold Brew 24h", "4.50 €", "cold brew coffee", description="Infusion à froid pendant 24h pour un café doux, fruité et sans amertume."),
+                _product("Café Filtre du Jour", "3.20 €", "filter coffee", description="Un café filtre artisanal, préparé chaque matin avec des grains torréfiés frais."),
+            ]},
+            {"name": "Boissons Chaudes & Alternatives", "products": [
+                _product("Matcha Latte", "4.80 €", "matcha latte", description="Thé matcha japonais biologique monté en latte crémeux."),
+                _product("Chocolat Chaud Artisanal", "4.00 €", "hot chocolate", description="Préparé avec du chocolat noir fondu, doux et intense à la fois."),
+                _product("Châi Latte Epicé", "4.50 €", "chai latte", description="Infusion d'épices indiennes, lait vaporé et touche de cannelle."),
+                _product("Latte Lavande", "4.60 €", "lavender latte", description="Espresso et sirop de lavande pour un latte floral et délicat."),
+                _product("Thé Noir Darjeeling", "3.50 €", "black tea", description="Un thé Darjeeling de première flush aux notes fleuries et muscatelées."),
+                _product("Tisane Maison", "3.20 €", "herbal tea", description="Mélange de plantes fraîches de saison composé par notre barista."),
+            ]},
+            {"name": "Pâtisseries & Snacks", "products": [
+                _product("Croissant Beurre AOP", "2.20 €", "butter croissant", description="Feuilletage doré et croustillant, préparé par notre boulanger partenaire."),
+                _product("Banana Bread Noix", "3.50 €", "banana bread", description="Un banana bread moelleux aux noix de pécan et pépites de chocolat."),
+                _product("Carrot Cake", "4.20 €", "carrot cake", description="Gâteau à la carotte et épices, nappé d'un glaçage fromage frais."),
+                _product("Cookie Double Chocolat", "2.80 €", "chocolate cookie", description="Un cookie géant croustillant dehors et fondant à l'intérieur."),
+                _product("Muffin Myrtille", "3.20 €", "blueberry muffin", description="Un muffin généreux garni de myrtilles fraîches et sucre croustillant."),
+                _product("Toast Avocat", "6.50 €", "avocado toast", description="Toast maison, purée d'avocat, œuf poché et graines de sésame."),
+            ]},
+            {"name": "Café en Grains & Accessoires", "products": [
+                _product("Grains Origine Ethiopie 250g", "14.90 €", "coffee beans", description="Grains Ethiopie Yirgacheffe aux notes florales et fruits rouges."),
+                _product("Grains Blend Signature 250g", "12.90 €", "roasted coffee beans", description="Notre mélange maison torréfié sur place, équilibré et gourmand."),
+                _product("Cafetière Chemex 6 Tasses", "49.90 €", "chemex coffee maker", description="La cafetière Chemex iconique pour un café filtre cristallin à la maison."),
+                _product("Kit Barista Débutant", "39.90 €", "barista kit", description="Tout le nécessaire pour réaliser des lattes art et cafés parfaits chez soi."),
+                _product("Capsules Bio x10", "6.90 €", "coffee capsules", description="Capsules compatibles Nespresso, café biologique certifié Rainforest."),
+                _product("Tasse Double Paroi 250ml", "18.90 €", "coffee cup", description="Tasse en verre double paroi qui garde votre boisson chaude plus longtemps."),
             ]},
         ]
     return [
@@ -694,6 +729,87 @@ def generate_smart_fallback(prompt: str) -> dict:
                 "brand_name": "Restaurant & Pizzeria",
                 "description": "Des ingrédients frais et des recettes traditionnelles préparées avec passion.",
                 "copyright": "© 2026 Restaurant & Pizzeria. Tous droits réservés.",
+            }, "footer_1"),
+        ]
+    elif any(k in p for k in ["coffee", "café", "coffee shop", "barista", "espresso"]):
+        theme = {
+            "primary_color": "#78350f",
+            "secondary_color": "#d97706",
+            "background_color": "#fffbf5",
+            "font_family": "serif",
+            "border_radius": "lg",
+        }
+        hero_keyword = "coffee shop"
+        sections = [
+            _navbar_section({
+                "brand_name": "Coffee Shop",
+                "cta_text": "Commander",
+            }, "navbar_1"),
+            {
+                "id": "hero_1",
+                "type": "hero",
+                "layout_style": "split_50_50",
+                "title": "Votre Coffee Shop Artisanal",
+                "subtitle": "Des cafés de spécialité, des pâtisseries maison et une atmosphère chaleureuse.",
+                "cta_text": "Voir le menu",
+                "image_keyword": hero_keyword,
+                "image_url": _stock_url(hero_keyword, 1600, 900),
+            },
+            {
+                "id": "stats_1",
+                "type": "stats",
+                "layout_style": "metric_grid",
+                "title": "Notre Coffee en Chiffres",
+                "metrics": [
+                    {"label": "Origines de café", "value": "12+"},
+                    {"label": "Clients quotidiens", "value": "300+"},
+                    {"label": "Recettes signatures", "value": "25"},
+                    {"label": "Années d'expertise", "value": "8"},
+                ],
+            },
+            make_columns("alternating_rows", [
+                {
+                    "title": "Cafés de Spécialité",
+                    "text": "Des grains soigneusement sélectionnés, torréfiés localement et préparés avec passion.",
+                    "content_type": "both",
+                    "image_keyword": "specialty coffee",
+                    "image_url": _stock_url("specialty coffee", 800, 600),
+                },
+                {
+                    "title": "Pâtisseries Maison",
+                    "text": "Croissants, banana bread et gâteaux préparés chaque matin par nos boulangers.",
+                    "content_type": "both",
+                    "image_keyword": "pastry coffee",
+                    "image_url": _stock_url("pastry coffee", 800, 600),
+                },
+                {
+                    "title": "Espace Cosy",
+                    "text": "Un cadre chaleureux pour travailler, lire ou simplement profiter du moment.",
+                    "content_type": "both",
+                    "image_keyword": "cozy cafe interior",
+                    "image_url": _stock_url("cozy cafe interior", 800, 600),
+                },
+            ]),
+            make_gallery("masonry_grid", [
+                {"title": "Latte Art", "image_keyword": "latte art", "image_url": _stock_url("latte art", 800, 600)},
+                {"title": "Cold Brew", "image_keyword": "cold brew", "image_url": _stock_url("cold brew", 800, 600)},
+                {"title": "Pâtisseries", "image_keyword": "cafe pastry", "image_url": _stock_url("cafe pastry", 800, 600)},
+                {"title": "Ambiance", "image_keyword": "cafe ambiance", "image_url": _stock_url("cafe ambiance", 800, 600)},
+            ]),
+            {
+                "id": "overlay_1",
+                "type": "overlay",
+                "layout_style": "split_cta",
+                "title": "Commandez Votre Café Préféré",
+                "subtitle": "Retrouvez tous nos cafés, boissons et pâtisseries dans notre boutique en ligne.",
+                "cta_text": "Voir le catalogue",
+                "image_keyword": "barista coffee",
+                "image_url": _stock_url("barista coffee", 1600, 900),
+            },
+            _footer_section({
+                "brand_name": "Coffee Shop",
+                "description": "Cafés de spécialité, pâtisseries maison et atmosphère chaleureuse.",
+                "copyright": "© 2026 Coffee Shop. Tous droits réservés.",
             }, "footer_1"),
         ]
     else:

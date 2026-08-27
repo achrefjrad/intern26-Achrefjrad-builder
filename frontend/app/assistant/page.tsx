@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 
 import { API_ENDPOINTS } from "@/lib/config"
 
-const API_URL = API_ENDPOINTS.generate
+const API_URL = API_ENDPOINTS.generateHomepage
 
 const EXAMPLES = [
   "Site pour une boulangerie artisanale à Lyon avec 3 colonnes pour nos spécialités",
@@ -27,7 +27,7 @@ export default function AssistantPage() {
     }
     setLoading(true)
     setError(null)
-    setStatus("L'IA réfléchit à votre projet...")
+    setStatus("L'IA génère votre page d'accueil...")
 
     try {
       const res = await fetch(API_URL, {
@@ -51,9 +51,12 @@ export default function AssistantPage() {
 
       const data = await res.json()
 
-      localStorage.setItem("ai_generated_config", JSON.stringify({ ...data, original_prompt: prompt.trim() }))
-      setStatus("Configuration générée ! Redirection vers l'éditeur...")
-      setTimeout(() => router.push("/"), 600)
+      localStorage.setItem(
+        "ai_generated_config",
+        JSON.stringify({ ...data, original_prompt: prompt.trim(), pending_catalog: true })
+      )
+      setStatus("Page d'accueil prête ! Redirection vers l'éditeur...")
+      setTimeout(() => router.push("/"), 400)
     } catch {
       setError("Impossible de contacter l'IA. Vérifiez que le serveur est lancé.")
       setStatus(null)

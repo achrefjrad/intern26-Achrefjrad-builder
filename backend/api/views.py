@@ -1,4 +1,4 @@
-﻿import json
+import json
 import os
 
 from django.core.files.storage import default_storage
@@ -6,9 +6,160 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
 from .models import Project, Category, Product, Order, OrderLine
-from .ai_service import generate_config, handle_chat_message
+from .ai_service import (
+    generate_config,
+    generate_homepage_config,
+    _normalize_homepage_config,
+    generate_catalog_config,
+    _normalize_catalog,
+    detect_category,
+    get_cached_generation,
+    set_cached_generation,
+)
 
 DEFAULT_DRAFT_PROJECT_NAME = "__draft__"
+
+
+def _save_catalog_to_project(project, catalog):
+    if not isinstance(catalog, list):
+        return
+    project.categories.all().delete()
+    for cat in catalog:
+        if not isinstance(cat, dict):
+            continue
+        cat_name = str(cat.get('name', '') or '').strip()
+        if not cat_name:
+            continue
+        category = Category.objects.create(project=project, name=cat_name)
+        products = cat.get('products')
+        if isinstance(products, list):
+            for prod in products:
+                if not isinstance(prod, dict):
+                    continue
+                prod_name = str(prod.get('name', '') or '').strip()
+                if not prod_name:
+                    continue
+                try:
+                    stock = int(prod.get('stock', 0) or 0)
+                except (ValueError, TypeError):
+                    stock = 0
+                Product.objects.create(
+                    category=category,
+                    name=prod_name,
+                    price=str(prod.get('price', '') or ''),
+                    description=str(prod.get('description', '') or '') or None,
+                    stock=stock,
+                    image_url=str(prod.get('image_url', '') or '') or None,
+                )
+
+
+class GenerateHomepageView(APIView):
+    def post(self, request):
+        prompt = request.data.get('prompt', '')
+        if not prompt or not isinstance(prompt, str):
+            return Response(
+                {'error': 'Le champ "prompt" est requis et doit être une chaîne de caractères.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        # Check prompt-based persistent cache first (handles any prompt, not just known categories)
+        cached = get_cached_generation(prompt)
+        if cached and cached.get('sections'):
+            draft_project, _ = Project.objects.get_or_create(
+                name=DEFAULT_DRAFT_PROJECT_NAME,
+                defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+            )
+            draft_project.original_prompt = prompt
+            draft_project.theme = cached.get("theme", {})
+            draft_project.sections = cached.get("sections", [])
+            draft_project.save()
+
+            result = {
+                'theme': cached.get("theme", {}),
+                'sections': cached.get("sections", []),
+                'original_prompt': prompt,
+                'category': detect_category(prompt),
+            }
+            return Response(result, status=status.HTTP_200_OK)
+
+        homepage = generate_homepage_config(prompt)
+        if isinstance(homepage, dict) and 'error' in homepage:
+            return Response(homepage, status=status.HTTP_502_BAD_GATEWAY)
+
+        draft_project, _ = Project.objects.get_or_create(
+            name=DEFAULT_DRAFT_PROJECT_NAME,
+            defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+        )
+        draft_project.original_prompt = prompt
+        draft_project.theme = homepage.get("theme", {})
+        draft_project.sections = homepage.get("sections", [])
+        draft_project.save()
+
+        result = {
+            'theme': homepage.get("theme", {}),
+            'sections': homepage.get("sections", []),
+            'original_prompt': prompt,
+            'category': detect_category(prompt),
+        }
+        return Response(result, status=status.HTTP_200_OK)
+
+
+class GenerateCatalogView(APIView):
+    def post(self, request):
+        prompt = request.data.get('prompt', '')
+        if not prompt or not isinstance(prompt, str):
+            return Response(
+                {'error': 'Le champ "prompt" est requis et doit être une chaîne de caractères.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        homepage_context = request.data.get('homepage_context', '')
+        brand_name = request.data.get('brand_name', '')
+        theme = request.data.get('theme', {})
+
+        if not homepage_context:
+            if brand_name:
+                homepage_context += f"brand: {brand_name}. "
+            if theme and isinstance(theme, dict):
+                primary_color = theme.get("primary_color", "")
+                if primary_color:
+                    homepage_context += "theme colors supplied. "
+
+        # Check prompt-based persistent cache first (any prompt, not just known categories)
+        cached = get_cached_generation(prompt)
+        if cached and cached.get('catalog'):
+            catalog_list = cached.get('catalog')
+            draft_project, _ = Project.objects.get_or_create(
+                name=DEFAULT_DRAFT_PROJECT_NAME,
+                defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+            )
+            _save_catalog_to_project(draft_project, catalog_list)
+            return Response({'catalog': catalog_list, 'original_prompt': prompt}, status=status.HTTP_200_OK)
+
+        catalog = generate_catalog_config(prompt, homepage_context)
+        if isinstance(catalog, dict) and 'error' in catalog:
+            from api.fallbacks import _fallback_catalog
+            catalog = _fallback_catalog(prompt)
+
+        catalog_list = catalog if isinstance(catalog, list) else []
+
+        draft_project, _ = Project.objects.get_or_create(
+            name=DEFAULT_DRAFT_PROJECT_NAME,
+            defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+        )
+        _save_catalog_to_project(draft_project, catalog_list)
+
+        # Persist complete template (sections must already be in draft from Stage 1)
+        if draft_project.sections and catalog_list:
+            full_result = {
+                'theme': draft_project.theme or {},
+                'sections': draft_project.sections or [],
+                'catalog': catalog_list,
+                'original_prompt': prompt,
+            }
+            set_cached_generation(prompt, full_result)
+
+        return Response({'catalog': catalog_list, 'original_prompt': prompt}, status=status.HTTP_200_OK)
 
 
 class GenerateView(APIView):
@@ -19,16 +170,79 @@ class GenerateView(APIView):
                 {'error': 'Le champ "prompt" est requis et doit être une chaîne de caractères.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        config = generate_config(prompt)
 
+        # Check prompt-based persistent cache before running LLM calls
+        cached = get_cached_generation(prompt)
+        if cached:
+            draft_project, _ = Project.objects.get_or_create(
+                name=DEFAULT_DRAFT_PROJECT_NAME,
+                defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
+            )
+            draft_project.original_prompt = prompt
+            draft_project.theme = cached.get("theme", {})
+            draft_project.sections = cached.get("sections", [])
+            draft_project.save()
+            _save_catalog_to_project(draft_project, cached.get("catalog", []))
+
+            result = {
+                'theme': cached.get("theme", {}),
+                'sections': cached.get("sections", []),
+                'catalog': cached.get("catalog", []),
+                'original_prompt': prompt,
+            }
+            return Response(result, status=status.HTTP_200_OK)
+
+        # Call 1: Generate homepage (theme + sections, no catalogue)
+        homepage = generate_homepage_config(prompt)
+        if isinstance(homepage, dict) and 'error' in homepage:
+            return Response(homepage, status=status.HTTP_502_BAD_GATEWAY)
+
+        # Extract minimal context from homepage for catalog generation
+        homepage_context = ""
+        if homepage and isinstance(homepage, dict):
+            theme = homepage.get("theme", {})
+            sections = homepage.get("sections", [])
+            # Extract brand name from navbar (first section if type is navbar).
+            brand_name = ""
+            if sections and len(sections) > 0:
+                first_sec = sections[0]
+                if first_sec.get("type") == "navbar":
+                    brand_name = first_sec.get("brand_name", "")
+            if brand_name:
+                homepage_context = f"brand: {brand_name}. "
+            if theme:
+                primary_color = theme.get("primary_color", "")
+                if primary_color:
+                    homepage_context += f"theme colors supplied. "
+
+        # Call 2: Generate catalog based on prompt + homepage context
+        catalog = generate_catalog_config(prompt, homepage_context)
+        if isinstance(catalog, dict) and 'error' in catalog:
+            from api.fallbacks import _fallback_catalog
+            catalog = _fallback_catalog(prompt)
+
+        # Save draft project
         draft_project, _ = Project.objects.get_or_create(
             name=DEFAULT_DRAFT_PROJECT_NAME,
             defaults={'theme': {}, 'sections': [], 'original_prompt': ''},
         )
         draft_project.original_prompt = prompt
-        draft_project.save(update_fields=['original_prompt'])
+        draft_project.theme = homepage.get("theme", {})
+        draft_project.sections = homepage.get("sections", [])
+        draft_project.save()
+        _save_catalog_to_project(draft_project, catalog if isinstance(catalog, list) else [])
 
-        return Response({**config, 'original_prompt': prompt}, status=status.HTTP_200_OK)
+        # Combine and persist complete generated website (prompt-keyed)
+        result = {
+            'theme': homepage.get("theme", {}),
+            'sections': homepage.get("sections", []),
+            'catalog': catalog if isinstance(catalog, list) else [],
+            'original_prompt': prompt,
+        }
+        if result['sections'] and result['catalog']:
+            set_cached_generation(prompt, result)
+
+        return Response(result, status=status.HTTP_200_OK)
 
 
 class ChatView(APIView):
